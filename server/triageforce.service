@@ -1,0 +1,15 @@
+[Unit]
+Description=TriageForce FastMCP Server Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=sansforensics
+WorkingDirectory=/opt/triageforce
+ExecStart=/opt/triageforce/venv/bin/mcp run /opt/triageforce/server.py
+Restart=always
+RestartSec=5
+Environment=PATH=/opt/triageforce/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target
