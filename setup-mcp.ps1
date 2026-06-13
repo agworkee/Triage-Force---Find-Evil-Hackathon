@@ -10,14 +10,15 @@ if (-not (Test-Path $ConfigDir)) {
 }
 
 $SiftConfig = @{
-    command = "npx"
+    command = "ssh"
     args = @(
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--host", "192.168.255.128",
-        "--port", "22",
-        "--username", "sansforensics",
-        "--password", "forensics"
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=10",
+        "sansforensics@192.168.255.128",
+        "sudo",
+        "/opt/triageforce/venv/bin/python",
+        "/opt/triageforce/server.py"
     )
 }
 
@@ -34,8 +35,8 @@ if (Test-Path $ConfigFile) {
             $CurrentConfig | Add-Member -MemberType NoteProperty -Name "mcpServers" -Value ([pscustomobject]@{})
         }
         
-        # Add or update the sift-workstation config
-        $CurrentConfig.mcpServers | Add-Member -MemberType NoteProperty -Name "sift-workstation" -Value $SiftConfig -Force
+        # Add or update the triageforce config
+        $CurrentConfig.mcpServers | Add-Member -MemberType NoteProperty -Name "triageforce" -Value $SiftConfig -Force
         
         $JsonConfig = $CurrentConfig | ConvertTo-Json -Depth 100
         $JsonConfig | Out-File -FilePath $ConfigFile -Encoding utf8 -Force
@@ -43,12 +44,12 @@ if (Test-Path $ConfigFile) {
     } catch {
         Write-Warning "Could not parse existing mcp_config.json. Creating a backup and overwriting."
         Copy-Item -Path $ConfigFile -Destination "$ConfigFile.bak" -Force
-        $NewConfig = [pscustomobject]@{ mcpServers = [pscustomobject]@{ "sift-workstation" = $SiftConfig } }
+        $NewConfig = [pscustomobject]@{ mcpServers = [pscustomobject]@{ "triageforce" = $SiftConfig } }
         $NewConfig | ConvertTo-Json -Depth 100 | Out-File -FilePath $ConfigFile -Encoding utf8 -Force
         Write-Host "Created new MCP config at: $ConfigFile (Backup saved as $ConfigFile.bak)"
     }
 } else {
-    $NewConfig = [pscustomobject]@{ mcpServers = [pscustomobject]@{ "sift-workstation" = $SiftConfig } }
+    $NewConfig = [pscustomobject]@{ mcpServers = [pscustomobject]@{ "triageforce" = $SiftConfig } }
     $NewConfig | ConvertTo-Json -Depth 100 | Out-File -FilePath $ConfigFile -Encoding utf8 -Force
     Write-Host "Created new MCP config at: $ConfigFile"
 }

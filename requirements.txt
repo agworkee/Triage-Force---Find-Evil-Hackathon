@@ -1,3 +1,4 @@
 # TriageForce agent dependencies
-anthropic>=0.28.0
+google-genai>=1.0.0
 mcp>=1.0.0
+python-dotenv>=1.0.0

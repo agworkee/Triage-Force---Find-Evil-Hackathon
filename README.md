@@ -1,55 +1,174 @@
-# Triage-Force - Find Evil Hackathon
+# TriageForce — Autonomous Forensic Triage Agent (Find Evil! Hackathon)
 
-Repository for the Triage-Force team participating in the Find Evil Hackathon. 
+TriageForce is an autonomous incident response and triage agent built for the SANS SIFT Workstation. It leverages the **Google Gemini SDK** and the **Model Context Protocol (MCP)** to securely automate forensic evidence gathering, artifact extraction, and correlation while strictly maintaining evidence integrity.
 
-This repository contains setup scripts and documentation to connect the Antigravity/Cursor AI agent with your SIFT Workstation VM for automated triage, forensic analysis, and evidence gathering.
+---
+
+## 🏗️ Technical Architecture
+
+TriageForce enforces security at the architectural level rather than relying solely on prompt-based restrictions.
+
+```
+┌─────────────────────────────────────────────────────┐
+│                 Local Host (Client)                 │
+│              agent.py (Gemini 2.0 Client)           │
+└──────────────────────┬──────────────────────────────┘
+                       │ SSH stdio tunnel (Passwordless)
+                       │ Command: sudo /opt/triageforce/server.py
+┌──────────────────────▼──────────────────────────────┐
+│         TriageForce MCP Server (FastMCP)             │
+│         SIFT VM Virtualenv (Root Context)            │
+│                                                      │
+│  ┌────────────────┐  ┌────────────────┐             │
+│  │  Tool Wrappers │  │ Output Parsers │             │
+│  │  (Type-Safe)   │  │ (Structured)   │             │
+│  └───────┬────────┘  └───────┬────────┘             │
+│          │ subprocess        │ JSON-RPC             │
+│  ┌───────▼────────────────────────────┐             │
+│  │      SIFT Tool Layer               │             │
+│  │  tshark | sha256sum | etc.         │             │
+│  └───────────────────────────────────┘             │
+│                                                      │
+│  ┌───────────────────────────────────┐              │
+│  │   Evidence Vault (Read-Only)      │              │
+│  │   /cases/case_001/evidence/       │              │
+│  │   (ewfmount + read-only bind)     │              │
+│  └───────────────────────────────────┘              │
+└─────────────────────────────────────────────────────┘
+```
+
+### Key Security & Integrity Boundaries:
+*   **No Generic Shell Access:** Unlike bridged SSH MCP servers that expose shell access, `server.py` exposes *only* typed, read-only tools:
+    *   `list_case_evidence`: Lists evidence files available in a case directory.
+    *   `get_evidence_integrity`: Computes case file hashes (`sha256sum`).
+    *   `run_tshark_summary`: Extracts network hierarchy information (`tshark`).
+    *   `analyze_prefetch`: Parses Windows Prefetch files (`PECmd`).
+    *   `analyze_amcache`: Parses Amcache registry hive (`AmcacheParser`).
+    *   `analyze_shimcache`: Parses AppCompatCache / ShimCache (`AppCompatCacheParser`).
+    *   `analyze_userassist`: Parses UserAssist registry entries (`RECmd`).
+    *   `analyze_recentapps`: Parses RecentApps registry entries (`RECmd`).
+    *   `analyze_sysmon`: Parses Sysmon Event Logs (`EvtxECmd`).
+    *   `analyze_evtx`: Parses Security, System, or Application logs (`EvtxECmd`).
+    *   `analyze_powershell_logs`: Parses PowerShell Event Logs (`EvtxECmd`).
+    *   `analyze_usn_journal`: Parses NTFS USN Change Journal (`MFTECmd`).
+    The agent has no mechanism to write files or run arbitrary commands.
+*   **Read-Only OS Mounts:** Original E01 disk images are mounted using `ewfmount` to stage a raw volume, which is then bind-mounted read-only at `/cases/case_001/evidence/` via `mount -o remount,ro,bind`.
+*   **Logical Consistency Checks:** Every iteration runs check rules inside `agent.py` to identify contradictions (e.g. conflicting hash results, timestamp timezone anomalies, or attempted write actions) and flags them immediately.
+
+---
+
+## 🧠 Self-Correcting DFIR Analyst Loop
+
+TriageForce transforms the simple tool-calling LLM model into a structured, self-correcting DFIR analyst by adding a dual-stage cognitive architecture:
+
+```mermaid
+graph TD
+    A[User Forensic Task] --> B[Investigation Stage]
+    B --> C{Model Call Tools?}
+    C -- Yes --> D[Run Remote SIFT Tool]
+    D --> E[Collect Artifacts & Findings]
+    E --> F[Parse Structured Claims]
+    F --> G[Evidence Correlator]
+    G --> B
+    C -- No/Done --> H[Verification Stage]
+    H --> I[Generate Verification Prompt]
+    I --> J[Challenge Finding/Hypothesis]
+    J --> K{Additional Evidence Needed?}
+    K -- Yes --> L[Call Verification Tool]
+    L --> M[Update Supporting/Contradictory Observations]
+    M --> J
+    K -- No/Done --> N[Run DFIR Validator Rules]
+    N --> O[Adjust Confidence Scores & Apply Penalties]
+    O --> P[Generate Forensic Correlation Report]
+    P --> Q[Log Traceability in JSONL]
+```
+
+### 1. Evidence Correlation & Objects
+Instead of unstructured text, findings are gathered into structured `EvidenceObject` records tracking:
+- **Hypothesis Lifecycle**: Assigned a unique identifier (e.g. `H-001`) tracking transition from `hypothesis` to `verified`, `refuted`, or `inconclusive`.
+- **Corroborating Sources**: Tracks which tool outputs and SIFT commands contributed to the finding.
+- **Observations**: Manages independent lists of `supporting_observations` and `contradictory_observations`.
+
+### 2. Multi-Source Confidence Scoring
+Confidence scores (`0.0` - `1.0`) are dynamically computed based on SIFT sources and modifiers:
+- **Base Score**: 1 source = `0.25` (Low), 2 independent sources = `0.50` (Medium), 3+ corroborating sources = `0.75` (High).
+- **Contradiction Modifier**: `-0.15` per contradictory observation.
+- **Verification Modifiers**: Successful verification adds `+0.10`; failed verification subtracts `-0.10`.
+- **DFIR Rule Warning**: Deducts `-0.05` per violation.
+
+### 3. Self-Correction Verification Loop
+When the model concludes its investigation stage, TriageForce starts a **Verification Stage** bounded by `MAX_VERIFICATION_ITERATIONS = 3` per finding:
+- The agent prompts the model to challenge its own findings as a senior validator.
+- The model identifies what extra evidence could verify or refute the finding, calls the relevant tools, and outputs a structured `verification_result`.
+- Findings are finalized as `verified`, `refuted` (if contradictory evidence outweighs support), or `inconclusive` (if iterations are exhausted without resolution).
+
+### 4. DFIR Knowledge-Driven Validation
+Post-verification, the `DFIRValidator` runs industry-standard rules to identify gaps:
+- `SINGLE_ARTIFACT`: Flag findings relying on only one source.
+- `EXECUTION_CORROBORATION`: Execution claims must check multiple sources (e.g., Prefetch + Amcache).
+- `LATERAL_MOVEMENT_CORROBORATION`: Lateral movement must have network + host evidence.
+- `PERSISTENCE_CORROBORATION`: Persistence claims require registry + filesystem checks.
+- `PRIVILEGE_ESCALATION_CORROBORATION`: Privilege escalation claims require multiple independent sources (e.g., Security Event Log + Sysmon).
+
+### 4.1 Investigation Planning
+Before executing tools to investigate a new hypothesis or branch, the agent generates a structured `investigation_plan` representing the hypothesis, required artifacts, tool selection rationale, and expected evidence. This is logged to the audit trail as an `investigation_plan` event.
+
+### 4.2 Forensic Timeline Reconstruction
+The `ForensicTimeline` collects timestamped events from tool outputs (Prefetch, Sysmon, EVTX, Amcache, UserAssist, USN Journal) and normalizes them to UTC. It analyzes them for chronological contradictions (e.g., execution before creation). Any contradiction triggers a penalty to the confidence score of related findings.
+
+### 4.3 MITRE ATT&CK Mapping
+The `MitreAttackMapper` automatically maps forensic findings to tactics and techniques of the MITRE ATT&CK framework across all 9 requested tactics: Initial Access, Execution, Persistence, Privilege Escalation, Defense Evasion, Discovery, Lateral Movement, Collection, and Exfiltration. Mappings are stored on the `EvidenceObject` and visualized in the final report.
+
+### 5. Full Execution Traceability
+Every phase of the cognitive loop writes detailed, structured logs to `agent_execution.jsonl` tracking events:
+- `evidence_created`
+- `confidence_update`
+- `verification_step`
+- `dfir_validation`
+- `report_generated`
 
 ---
 
 ## 🛠️ Environment Configuration
 
-To allow the AI agent to connect to the SIFT Workstation and run forensic tools, we use an **SSH MCP (Model Context Protocol) Server**.
+### SIFT Workstation VM Setup
+Ensure python virtualenv and custom server script are correctly placed on the SIFT VM:
+1. **Server Directory:** `/opt/triageforce/`
+2. **Server Python Venv:** `/opt/triageforce/venv/`
+3. **Mounted Case Data:** `/cases/case_001/evidence/` (Contains read-only mounted raw file `ewf1`).
+4. **Passwordless sudo:** The `sansforensics` user must be configured for passwordless sudo (standard on SIFT workstation VMs) to access the raw evidence files owned by `root`.
 
-### Connection Details
-*   **Target IP:** `192.168.255.128`
-*   **SSH Port:** `22`
-*   **Username:** `sansforensics`
-*   **Password:** `forensics`
-
----
-
-## 🚀 Getting Started
-
-### 1. Automatically Configure the SSH MCP Server
-Run the PowerShell script included in this repository to automatically write the SIFT Workstation configuration into your IDE settings (`~/.gemini/config/mcp_config.json`):
-
-```powershell
-# Run this from the repository root
-.\setup-mcp.ps1
-```
-
-### 2. Manual Configuration
-If you prefer to configure it manually, add the following object to the `mcpServers` section of your `~/.gemini/config/mcp_config.json` file:
-
-```json
-{
-  "mcpServers": {
-    "sift-workstation": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@fangjunjie/ssh-mcp-server",
-        "--host", "192.168.255.128",
-        "--port", "22",
-        "--username", "sansforensics",
-        "--password", "forensics"
-      ]
-    }
-  }
-}
-```
+### Local Client Setup (Windows Host)
+1. **Configure SSH Keys:** Establish passwordless SSH connection to the SIFT VM (`ssh-copy-id sansforensics@192.168.255.128`).
+2. **Set API Key:** Create a `.env` file in the root directory of this repository and populate your Gemini API Key:
+    ```env
+    GEMINI_API_KEY="your-gemini-api-key-here"
+    ```
+3. **Register MCP in IDE (Optional):** Run the PowerShell setup script to automatically write the custom `triageforce` server profile to your IDE config (`~/.gemini/config/mcp_config.json`):
+    ```powershell
+    .\setup-mcp.ps1
+    ```
 
 ---
 
-## 🔍 Verifying the Connection
-Once configured, reload the IDE or agent panel. The `sift-workstation` MCP server will start up, allowing you to run terminal commands, view files, and triage artifacts on the SIFT VM directly through the AI agent interface.
+## 🚀 Usage
+
+Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+### 1. Run Connection Diagnostic
+Run the pre-flight connection test to validate the Gemini API authentication, SSH authentication, remote python venv, and MCP tool discovery:
+```bash
+python agent.py --test-connection
+```
+
+### 2. Start Triage Task
+Launch the autonomous forensic agent to investigate case files:
+```bash
+python agent.py --task "Generate a list of case evidence files and compile a protocol hierarchy summary of the network pcap"
+```
+
+### 3. Review Audit Logs
+Every session writes detailed, structured JSONL trace logs to `agent_execution.jsonl` tracking iterations, token counts, tool calls, and consistency outcomes for evaluation.
