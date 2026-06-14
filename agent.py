@@ -73,7 +73,7 @@ SSH_FLAGS = [
     REMOTE_MCP_SERVER_CMD,
 ] + REMOTE_MCP_SERVER_ARGS
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 AUDIT_LOG_PATH = Path("agent_execution.jsonl")
 
@@ -1772,6 +1772,11 @@ async def run_agent(
 
                 # Collect text findings and detect function calls
                 function_calls = []
+                if not candidate.content or not candidate.content.parts:
+                    logger.log_agent_decision(iteration, "empty_response", 
+                        "Model returned empty content, skipping iteration.")
+                    print(f"  [Warning] Model returned empty response, continuing...")
+                    break
                 for part in candidate.content.parts:
                     if part.text:
                         all_findings.append(part.text.strip())
@@ -2034,6 +2039,11 @@ async def run_agent(
 
                         # Process text and look for verification result
                         function_calls = []
+                        if not candidate.content or not candidate.content.parts:
+                            logger.log_agent_decision(iteration, "empty_response", 
+                                "Model returned empty content, skipping iteration.")
+                            print(f"  [Warning] Model returned empty response, continuing...")
+                            break
                         for part in candidate.content.parts:
                             if part.text:
                                 all_findings.append(part.text.strip())
