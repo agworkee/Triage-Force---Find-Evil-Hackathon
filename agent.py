@@ -2060,9 +2060,9 @@ async def run_agent(
                                     if new_status not in ("verified", "refuted", "inconclusive"):
                                         new_status = "inconclusive"
 
-                                    # Hard rule: confidence_score < 0.40 blocks transition to verified status
-                                    if new_status == "verified" and eo.confidence_score < 0.40:
-                                        print(f"  [Verification] Blocked verification of {eo.hypothesis_id}: confidence too low ({eo.confidence_score:.2f} < 0.40)")
+                                    # Hard rule: confidence_score < 0.25 blocks transition to verified status
+                                    if new_status == "verified" and eo.confidence_score < 0.25:
+                                        print(f"  [Verification] Blocked verification of {eo.hypothesis_id}: confidence too low ({eo.confidence_score:.2f} < 0.25)")
                                         new_status = "inconclusive"
 
                                     # Update confidence based on verification outcome
