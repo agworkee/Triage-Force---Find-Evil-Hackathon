@@ -393,20 +393,92 @@ def analyze_amcache(case_id: str, executable_filter: str = "") -> str:
     if amcache_path is None:
         return json.dumps({"error": "Path traversal detected"})
 
-    if not os.path.exists(amcache_path):
-        # Fallback: search for Amcache.hve anywhere in evidence
-        amcache_candidates = glob.glob(
-            os.path.join(evidence_dir, "**", "Amcache.hve"),
-            recursive=True
-        )
-        if amcache_candidates:
-            amcache_path = amcache_candidates[0]
-        else:
-            return json.dumps({
-                "error": f"Amcache.hve not found at {ARTIFACT_PATHS['amcache']}",
-                "artifact_source": "amcache",
-                "case_id": case_id,
-            })
+    found_amcache = False
+    if os.path.exists(amcache_path):
+        found_amcache = True
+    else:
+        # Check other likely paths
+        likely_paths = [
+            "Windows/AppCompat/Programs/Amcache.hve",
+            "Windows/appcompat/Programs/Amcache.hve",
+            "WINDOWS/AppCompat/Programs/Amcache.hve",
+            "WINDOWS/appcompat/Programs/Amcache.hve",
+            "windows/AppCompat/Programs/Amcache.hve",
+            "windows/appcompat/Programs/Amcache.hve",
+            "Windows.old/Windows/AppCompat/Programs/Amcache.hve",
+            "Windows.old/Windows/appcompat/Programs/Amcache.hve"
+        ]
+        for rel_path in likely_paths:
+            if rel_path == ARTIFACT_PATHS["amcache"]:
+                continue
+            cand_path = safe_evidence_path(case_id, rel_path)
+            if cand_path and os.path.exists(cand_path):
+                amcache_path = cand_path
+                found_amcache = True
+                break
+
+    if not found_amcache:
+        # Bounded search only in reasonable Windows artifact zones
+        starting_zones = []
+        for zone_name in ["Windows", "WINDOWS", "windows", "Windows.old"]:
+            zone_path = safe_evidence_path(case_id, zone_name)
+            if zone_path and os.path.isdir(zone_path):
+                starting_zones.append(zone_path)
+        
+        # If no Windows-like directories are present, start from evidence root
+        if not starting_zones:
+            starting_zones = [evidence_dir]
+            
+        for zone in starting_zones:
+            for root, dirs, files in os.walk(zone, followlinks=False):
+                # Calculate current depth relative to zone
+                if root == zone:
+                    depth = 0
+                else:
+                    rel = os.path.relpath(root, zone)
+                    depth = len(rel.split(os.sep))
+                
+                # Prune high-volume or junction-like directories case-insensitively
+                prune_names = {
+                    "documents and settings",
+                    "system volume information",
+                    "$recycle.bin",
+                    "recovery",
+                    "winsxs",
+                    "program files",
+                    "program files (x86)",
+                    "users",
+                    "programdata",
+                    "inetpub",
+                    "config.msi"
+                }
+                dirs[:] = [d for d in dirs if d.lower() not in prune_names]
+                
+                # Limit depth recursion
+                if depth >= 6:
+                    dirs.clear()
+                
+                # Stop immediately when a file named Amcache.hve is found, case-insensitive
+                for f in files:
+                    if f.lower() == "amcache.hve":
+                        amcache_path = os.path.join(root, f)
+                        found_amcache = True
+                        break
+                if found_amcache:
+                    break
+            if found_amcache:
+                break
+
+    if not found_amcache:
+        return json.dumps({
+            "status": "no_results",
+            "artifact_source": "amcache",
+            "case_id": case_id,
+            "error": "Amcache.hve not located in canonical paths or bounded safe search.",
+            "possible_reason": "Unsupported Windows version, Amcache absent, Amcache cleared, nonstandard mount layout, or artifact outside bounded search scope",
+            "search_scope": "canonical paths plus bounded safe search of Windows-like artifact zones",
+            "pivot_suggestion": "Run analyze_mft with filename_filter='Amcache.hve', analyze_usn_journal with filename_filter='Amcache.hve', and analyze_shimcache for alternate execution evidence"
+        })
 
     cmd = [
         "AmcacheParser", "-f", amcache_path,
