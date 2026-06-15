@@ -43,31 +43,83 @@ def run_local_command(args: List[str], timeout: int = 60) -> Dict[str, Any]:
     """
     Safely executes a system command and returns structured JSON output.
     All execution parameters are validated to prevent command injection.
+    If the command times out, it terminates the process group.
     """
     logger.info(f"Running command: {' '.join(args)}")
+    import sys
+    import signal
+
+    kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    if sys.platform == "win32":
+        # Create a new process group on Windows so we can kill all child processes
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    else:
+        # Create a new process group/session on POSIX
+        kwargs["start_new_session"] = True
+
     try:
-        result = subprocess.run(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-            check=False
-        )
-        return {
-            "exit_code": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "status": "success" if result.returncode == 0 else "failed"
-        }
-    except subprocess.TimeoutExpired:
-        logger.error(f"Command timed out: {' '.join(args)}")
-        return {
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": "Command timed out after {} seconds".format(timeout),
-            "status": "timeout"
-        }
+        proc = subprocess.Popen(args, **kwargs)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return {
+                "exit_code": proc.returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "status": "success" if proc.returncode == 0 else "failed"
+            }
+        except subprocess.TimeoutExpired:
+            logger.error(f"Command timed out after {timeout} seconds: {' '.join(args)}")
+
+            # Terminate the process group
+            if sys.platform == "win32":
+                try:
+                    os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
+                except Exception as ke:
+                    logger.error(f"Failed to send CTRL_BREAK_EVENT: {ke}")
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                # Fallback taskkill
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                except Exception as ke:
+                    logger.error(f"Failed to kill pgid: {ke}")
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+            # Re-read or wait to clean up zombie process descriptors
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "Command timed out after {} seconds".format(timeout),
+                "status": "timeout"
+            }
     except Exception as e:
         logger.error(f"Error running command: {str(e)}")
         return {
@@ -126,10 +178,10 @@ def get_evidence_integrity(case_id: str, file_path: str) -> str:
     safe_path = os.path.normpath(os.path.join(EVIDENCE_BASE_DIR, case_id, "evidence", file_path))
     if not safe_path.startswith(EVIDENCE_BASE_DIR):
         return json.dumps({"error": "Path traversal detected"})
-        
+
     if not os.path.exists(safe_path):
         return json.dumps({"error": f"Evidence file not found: {file_path}"})
-        
+
     res = run_local_command(["sha256sum", safe_path], timeout=300)
     if res["status"] == "success":
         parts = res["stdout"].strip().split()
@@ -145,14 +197,14 @@ def run_tshark_summary(case_id: str, pcap_name: str, max_conversations: int = 50
     safe_path = os.path.normpath(os.path.join(EVIDENCE_BASE_DIR, case_id, "evidence", pcap_name))
     if not safe_path.startswith(EVIDENCE_BASE_DIR):
         return json.dumps({"error": "Path traversal detected"})
-        
+
     if not os.path.exists(safe_path):
         return json.dumps({"error": f"PCAP file not found: {pcap_name}"})
-        
+
     # Example command to extract protocol hierarchy summary
     cmd = ["tshark", "-r", safe_path, "-q", "-z", "io,phs"]
     res = run_local_command(cmd, timeout=30)
-    
+
     if res["status"] == "success":
         return json.dumps({
             "pcap": pcap_name,
@@ -174,10 +226,10 @@ def list_case_evidence(case_id: str) -> str:
     case_path = os.path.normpath(os.path.join(EVIDENCE_BASE_DIR, case_id, "evidence"))
     if not case_path.startswith(EVIDENCE_BASE_DIR):
         return json.dumps({"error": "Path traversal detected"})
-        
+
     if not os.path.exists(case_path):
         return json.dumps({"error": f"Case directory not found: {case_id}"})
-        
+
     try:
         files = []
         for entry in os.scandir(case_path):
@@ -245,7 +297,7 @@ def analyze_prefetch(case_id: str, executable_filter: str = "") -> str:
             else:
                 rel = os.path.relpath(root, evidence_dir)
                 depth = len(rel.split(os.sep))
-            
+
             # Prune directories we don't want to visit
             prune_names = {
                 "documents and settings",
@@ -260,11 +312,11 @@ def analyze_prefetch(case_id: str, executable_filter: str = "") -> str:
             }
             # Modify dirs in-place to prune them from traversal
             dirs[:] = [d for d in dirs if d.lower() not in prune_names]
-            
+
             # Limit depth recursion
             if depth >= 4:
                 dirs.clear()
-            
+
             # Stop as soon as a directory named Prefetch is found
             for d in dirs:
                 if d.lower() == "prefetch":
@@ -424,11 +476,11 @@ def analyze_amcache(case_id: str, executable_filter: str = "") -> str:
             zone_path = safe_evidence_path(case_id, zone_name)
             if zone_path and os.path.isdir(zone_path):
                 starting_zones.append(zone_path)
-        
+
         # If no Windows-like directories are present, start from evidence root
         if not starting_zones:
             starting_zones = [evidence_dir]
-            
+
         for zone in starting_zones:
             for root, dirs, files in os.walk(zone, followlinks=False):
                 # Calculate current depth relative to zone
@@ -437,7 +489,7 @@ def analyze_amcache(case_id: str, executable_filter: str = "") -> str:
                 else:
                     rel = os.path.relpath(root, zone)
                     depth = len(rel.split(os.sep))
-                
+
                 # Prune high-volume or junction-like directories case-insensitively
                 prune_names = {
                     "documents and settings",
@@ -453,11 +505,11 @@ def analyze_amcache(case_id: str, executable_filter: str = "") -> str:
                     "config.msi"
                 }
                 dirs[:] = [d for d in dirs if d.lower() not in prune_names]
-                
+
                 # Limit depth recursion
                 if depth >= 6:
                     dirs.clear()
-                
+
                 # Stop immediately when a file named Amcache.hve is found, case-insensitive
                 for f in files:
                     if f.lower() == "amcache.hve":
@@ -1223,7 +1275,16 @@ def analyze_usn_journal(case_id: str, filename_filter: str = "", reason_filter: 
         "MFTECmd", "-f", usn_path,
         "--csv", "/tmp", "--csvf", "usn_output.csv"
     ]
-    res = run_local_command(cmd, timeout=300)
+    res = run_local_command(cmd, timeout=60)
+
+    if res.get("status") == "timeout":
+        return json.dumps({
+            "status": "timeout",
+            "artifact_source": "usn_journal",
+            "case_id": case_id,
+            "error": "analyze_usn_journal execution timed out.",
+            "pivot_suggestion": "Run analyze_prefetch, analyze_amcache, and analyze_shimcache to identify program executions, or query specific event IDs via analyze_evtx / analyze_sysmon."
+        })
 
     entries: List[Dict[str, Any]] = []
     if os.path.exists(csv_path):
@@ -1330,7 +1391,18 @@ def analyze_mft(case_id: str, filename_filter: str = "", max_entries: int = 300,
         "MFTECmd", "-f", mft_path,
         "--csv", "/tmp", "--csvf", "mft_output.csv"
     ]
-    res = run_local_command(cmd, timeout=300)
+    # Broad MFT parse (no filter) gets a short timeout; filtered queries get longer
+    mft_timeout = 60 if not filename_filter else 120
+    res = run_local_command(cmd, timeout=mft_timeout)
+
+    if res.get("status") == "timeout":
+        return json.dumps({
+            "status": "timeout",
+            "artifact_source": "mft",
+            "case_id": case_id,
+            "error": "analyze_mft execution timed out. Broad MFT parses are expensive.",
+            "pivot_suggestion": "Rerun analyze_mft with a specific filename_filter (e.g. filename_filter='Prefetch' or filename_filter='Amcache.hve'), or use analyze_prefetch, analyze_amcache, analyze_shimcache for targeted execution evidence."
+        })
 
     entries: List[Dict[str, Any]] = []
     if os.path.exists(csv_path):
@@ -1440,7 +1512,19 @@ def analyze_registry_hive(case_id: str, hive_name: str, key_name: str = "") -> s
     if key_name:
         cmd.extend(["--kn", key_name])
 
-    res = run_local_command(cmd, timeout=180)
+    # Full registry hive scan (no key_name) gets a short timeout; filtered queries get longer
+    reg_timeout = 60 if not key_name else 120
+    res = run_local_command(cmd, timeout=reg_timeout)
+
+    if res.get("status") == "timeout":
+        return json.dumps({
+            "status": "timeout",
+            "artifact_source": "registry",
+            "case_id": case_id,
+            "hive_name": hive_name_upper,
+            "error": "analyze_registry_hive execution timed out. Full hive scans without a key_name filter are expensive.",
+            "pivot_suggestion": "Rerun with a specific key_name (e.g. key_name='ControlSet001\\Services'), or use analyze_services, analyze_autoruns, or analyze_sam_users for targeted analysis."
+        })
 
     entries: List[Dict[str, Any]] = []
     if os.path.exists(csv_path):
@@ -1740,22 +1824,22 @@ def _parse_rip_services(stdout: str) -> List[Dict[str, Any]]:
     entries = []
     current_ts = ""
     current_entry = {}
-    
+
     for line in stdout.splitlines():
         line_strip = line.strip()
         if not line_strip:
             continue
-            
+
         if line_strip.endswith(" Z") or line_strip.endswith(" UTC") or (len(line_strip.split()) >= 5 and ":" in line_strip):
             if "=" not in line_strip:
                 current_ts = line_strip
                 continue
-        
+
         if "=" in line_strip:
             parts = line_strip.split("=", 1)
             key = parts[0].strip().lower()
             val = parts[1].strip()
-            
+
             if key == "name":
                 if current_entry and "service_name" in current_entry:
                     entries.append(current_entry)
@@ -1774,27 +1858,27 @@ def _parse_rip_services(stdout: str) -> List[Dict[str, Any]]:
                     current_entry["service_type"] = val
                 elif key == "group":
                     current_entry["group"] = val
-                    
+
     if current_entry and "service_name" in current_entry:
         entries.append(current_entry)
-        
+
     return entries
 
 
 def _parse_rip_sam(stdout: str) -> List[Dict[str, Any]]:
     entries = []
     current_entry = {}
-    
+
     for line in stdout.splitlines():
         line_strip = line.strip()
         if not line_strip:
             continue
-            
+
         if line_strip.startswith("Username"):
             if current_entry and "username" in current_entry:
                 current_entry["account_flags"] = ", ".join(current_entry["account_flags"])
                 entries.append(current_entry)
-            
+
             parts = line_strip.split(":", 1)
             raw_val = parts[1].strip()
             username = raw_val
@@ -1803,18 +1887,18 @@ def _parse_rip_sam(stdout: str) -> List[Dict[str, Any]]:
                 u_parts = raw_val.rsplit("[", 1)
                 username = u_parts[0].strip()
                 rid = u_parts[1].replace("]", "").strip()
-                
+
             current_entry = {
                 "username": username,
                 "rid": rid,
                 "account_flags": []
             }
-            
+
         elif current_entry and ":" in line_strip:
             parts = line_strip.split(":", 1)
             key = parts[0].strip().lower()
             val = parts[1].strip()
-            
+
             if key == "sid":
                 current_entry["sid"] = val
             elif key == "full name":
@@ -1833,15 +1917,15 @@ def _parse_rip_sam(stdout: str) -> List[Dict[str, Any]]:
                 current_entry["password_fail"] = val
             elif key == "login count":
                 current_entry["login_count"] = val
-                
+
         elif current_entry and line_strip.startswith("-->"):
             flag = line_strip.replace("-->", "").strip()
             current_entry["account_flags"].append(flag)
-            
+
     if current_entry and "username" in current_entry:
         current_entry["account_flags"] = ", ".join(current_entry["account_flags"])
         entries.append(current_entry)
-        
+
     return entries
 
 

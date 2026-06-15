@@ -117,6 +117,42 @@ INVESTIGATION_SYSTEM_PROMPT = (
     "- Require corroboration for persistence claims (registry + filesystem).\n"
     "- When citing evidence, be precise: include file paths, hash values, and timestamps.\n\n"
 
+    "ARTIFACT PRIORITIZATION ORDER:\n"
+    "You MUST run lightweight, targeted artifact tools BEFORE broad filesystem scans.\n"
+    "Follow this priority order for every investigation:\n"
+    "  Priority 1 (run FIRST):\n"
+    "    - analyze_amcache (execution evidence with SHA1 hashes)\n"
+    "    - analyze_shimcache (execution evidence with timestamps)\n"
+    "    - analyze_evtx with event_ids='7045' log_name='System' (service installations)\n"
+    "    - analyze_evtx with event_ids='4624,4672,4688' log_name='Security' (logons, privileges, process creation)\n"
+    "    - analyze_sysmon (process creation, network, file events)\n"
+    "    - analyze_powershell_logs (script block logging)\n"
+    "    - analyze_services (persistence via services)\n"
+    "    - analyze_scheduled_tasks (persistence via tasks)\n"
+    "    - analyze_autoruns (all persistence locations)\n"
+    "  Priority 2 (run SECOND, only after Priority 1):\n"
+    "    - analyze_prefetch (execution with run counts)\n"
+    "    - analyze_userassist / analyze_recentapps\n"
+    "    - analyze_lnk_files / analyze_recyclebin\n"
+    "    - analyze_sam_users / analyze_browser_history\n"
+    "  Priority 3 (run LAST, only with specific filters):\n"
+    "    - analyze_mft -- ALWAYS use filename_filter (e.g. filename_filter='Sysmon64.exe')\n"
+    "    - analyze_usn_journal -- ALWAYS use filename_filter or reason_filter\n"
+    "    - analyze_registry_hive -- ALWAYS use key_name (e.g. key_name='ControlSet001\\\\Services')\n"
+    "  NEVER run analyze_mft, analyze_usn_journal, or analyze_registry_hive without a filter.\n"
+    "  Broad unfiltered scans are expensive, will time out, and waste iterations.\n\n"
+
+    "TIMEOUT AND BROAD SCAN SAFETY:\n"
+    "The following tools have hard execution timeouts and WILL return status='timeout' if they exceed the limit:\n"
+    "  - analyze_mft without filename_filter: 60-second timeout\n"
+    "  - analyze_usn_journal without filename_filter: 60-second timeout\n"
+    "  - analyze_registry_hive without key_name: 60-second timeout\n"
+    "When you receive a status='timeout' response:\n"
+    "  1. Do NOT retry the same broad query.\n"
+    "  2. Read the pivot_suggestion field in the response and follow it.\n"
+    "  3. Rerun the tool with a specific filter, or switch to a Priority 1 artifact.\n"
+    "  4. Document the timeout in your investigation notes.\n\n"
+
     "FORENSIC PIVOT RULES:\n"
     "When a tool returns an error or no results, do NOT skip the "
     "artifact class. Instead:\n"
@@ -199,8 +235,8 @@ INVESTIGATION_SYSTEM_PROMPT = (
 
     "INITIAL ACCESS / SYSTEM ZERO PROTOCOL:\n"
     "After persistence, credential dumping, or administrator logon activity is identified:\n"
-    "  1. Attempt to identify the earliest suspicious timestamp across MFT, USN Journal, ShimCache, Sysmon, EVTX, browser history, and user activity artifacts.\n"
-    "  2. Use analyze_mft and analyze_usn_journal with summary_only=True first for broad searches, then rerun with narrower filename_filter values when suspicious files are found.\n"
+    "  1. Attempt to identify the earliest suspicious timestamp across ShimCache, Amcache, Sysmon, EVTX, Prefetch, browser history, and user activity artifacts FIRST.\n"
+    "  2. Only after exhausting Priority 1 and 2 artifacts, use analyze_mft and analyze_usn_journal with a SPECIFIC filename_filter (e.g. the suspicious executable name). NEVER run them without a filter.\n"
     "  3. Pivot on users, filenames, download paths, browser history, installer names, archive files, scripts, and user-writable directories.\n"
     "  4. Do not guess initial access. If the first observed malicious action is not the true entry point, clearly label it as earliest observed activity.\n"
     "This protocol is mandatory once the agent has enough evidence of compromise to reconstruct the attack timeline.\n\n"
@@ -245,6 +281,7 @@ class EvidenceObject:
     updated_at: str = ""
     parent_hypothesis_id: str = ""
     attack_mappings: list[dict[str, Any]] = field(default_factory=list)
+    evidence_gaps: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-safe dictionary."""
@@ -255,6 +292,7 @@ class EvidenceObject:
             "artifacts": self.artifacts,
             "supporting_observations": self.supporting_observations,
             "contradictory_observations": self.contradictory_observations,
+            "evidence_gaps": self.evidence_gaps,
             "confidence_score": round(self.confidence_score, 2),
             "confidence_label": self.confidence_label,
             "hypothesis_id": self.hypothesis_id,
@@ -277,38 +315,102 @@ class EvidenceObject:
             return "LOW"
 
 
+def _parse_sources(source_str: str) -> list[str]:
+    """Split comma-separated evidence sources and strip whitespace."""
+    if not source_str:
+        return []
+    parts = [p.strip() for p in source_str.split(",")]
+    return [p for p in parts if p]
+
+
+def _extract_executables_and_tools(text: str) -> set[str]:
+    """Extract specific program/tool names from text."""
+    import re
+    text_lower = text.lower()
+    found = set()
+
+    # 1. Extensions
+    exes = re.findall(r'\b([\w\.-]+)\.(?:exe|dll|sys|bat|ps1|vbs|bin)\b', text_lower)
+    for e in exes:
+        found.add(e)
+
+    # 2. Known tools/programs without extension
+    known_tools = ["pwdumpx", "pwdump", "powershell", "cmd", "schtasks", "psexec", "psexesvc", "mimikatz", "sysmon", "sysmon64", "wmic", "rundll32", "regsvr32", "reg"]
+    for tool in known_tools:
+        if re.search(rf'\b{tool}\b', text_lower):
+            found.add(tool)
+
+    return found
+
+
+def _is_absence_claim(claim_text: str) -> bool:
+    """Detect if a claim represents an absence of evidence."""
+    text = claim_text.lower()
+    negatives = [
+        "missing", "no results", "absence", "not found", "absent",
+        "no evidence", "does not exist", "unable to find", "empty",
+        "no event", "no log", "no record", "no 7045", "missing 7045",
+        "did not find", "failure to locate", "not present"
+    ]
+    return any(neg in text for neg in negatives)
+
+
+def _is_direct_disproof(positive_claim: str, absence_claim: str) -> bool:
+    """Determine if an absence claim directly disproves a positive claim."""
+    pos_exes = _extract_executables_and_tools(positive_claim)
+    abs_exes = _extract_executables_and_tools(absence_claim)
+
+    common_exes = pos_exes.intersection(abs_exes)
+    if not common_exes:
+        return False
+
+    abs_lower = absence_claim.lower()
+    pos_lower = positive_claim.lower()
+
+    for exe in common_exes:
+        if any(neg in abs_lower for neg in ["not found", "does not exist", "no such file", "missing", "absent"]):
+            # Missing Event IDs are usually evidence gaps, unless positive claim specifically asserted that log event
+            if "7045" in abs_lower or "event id" in abs_lower:
+                if "7045" in pos_lower or "event id" in pos_lower or "log" in pos_lower:
+                    return True
+                return False
+            return True
+
+    return False
+
+
 def _extract_specific_entities(text: str) -> set[str]:
     import re
     entities = set()
     text_lower = text.lower()
-    
+
     # 1. Executables / extensions (excluding generic ones like case files, but keeping main system artifacts)
     executables = re.findall(r'\b[\w\.-]+\.(?:exe|dll|sys|bat|ps1|vbs|bin|hve|evtx|e01)\b', text_lower)
     # Exclude generic setup files if any
     for exe in executables:
         if "case" not in exe:
             entities.add(exe)
-    
+
     # 2. IP Addresses
     ips = re.findall(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', text_lower)
     entities.update(ips)
-    
+
     # 3. Registry paths or keys
     reg_paths = re.findall(r'\b(?:hklm|hkcu|controlset\d{3}|currentcontrolset|services|sam|software|security|registry|domains\\account\\users|ntuser)\b', text_lower)
     entities.update(reg_paths)
-    
+
     # 4. File paths or relative paths (containing backslash/slash, excluding cases directory paths)
     paths = re.findall(r'\b[\w\.-]+[\\/][\w\.-]+[\\/\w\.-]*', text_lower)
     for p in paths:
         if "cases" not in p and "evidence" not in p:
             entities.add(p)
-    
+
     # 5. Usernames (common ones in case files, plus common Windows users)
     usernames = {"administrator", "guest", "rsydow", "rsydow-a", "ftpadmin", "nfury", "dblake", "system", "local service", "network service"}
     for u in usernames:
         if re.search(rf'\b{u}\b', text_lower):
             entities.add(u)
-            
+
     return entities
 
 
@@ -328,7 +430,7 @@ def _truncate_tool_result(result_content: Any) -> str:
         raw_text = "".join(parts)
     else:
         raw_text = str(result_content)
-        
+
     try:
         data = json.loads(raw_text)
         if isinstance(data, dict) and "entries" in data and isinstance(data["entries"], list):
@@ -344,8 +446,399 @@ def _truncate_tool_result(result_content: Any) -> str:
                 return json.dumps(truncated_data)
     except Exception:
         pass
-        
+
     return raw_text
+
+
+def _extract_text_content(content: Any) -> str:
+    """Extract raw text from tool result content, handling strings, lists, or dicts."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif hasattr(part, "text") and part.text:
+                parts.append(part.text)
+            elif isinstance(part, dict) and "text" in part:
+                parts.append(part["text"])
+        return "".join(parts)
+    return str(content)
+
+
+@dataclass
+class ObservedEvidenceItem:
+    source_tool: str
+    artifact_family: str
+    raw_entry: dict[str, Any]
+    summary: str
+    entities: set[str] = field(default_factory=set)
+    executables: set[str] = field(default_factory=set)
+    service_names: set[str] = field(default_factory=set)
+    paths: set[str] = field(default_factory=set)
+    hashes: set[str] = field(default_factory=set)
+    users: set[str] = field(default_factory=set)
+    timestamp: str | None = None
+    attack_concepts: set[str] = field(default_factory=set)
+
+
+class ObservedEvidenceStore:
+    def __init__(self) -> None:
+        self.items: list[ObservedEvidenceItem] = []
+
+    def add_item(self, item: ObservedEvidenceItem) -> None:
+        self.items.append(item)
+
+    def add_from_tool_output(self, tool_name: str, result_content: Any) -> None:
+        """Parse structured tool output JSON and extract observed evidence."""
+        try:
+            raw_text = _extract_text_content(result_content)
+            data = json.loads(raw_text)
+            if not isinstance(data, dict):
+                return
+            entries = data.get("entries", [])
+            if not isinstance(entries, list):
+                return
+
+            for entry in entries:
+                self._parse_entry(tool_name, entry)
+        except Exception:
+            pass
+
+    def _parse_entry(self, tool_name: str, entry: dict[str, Any]) -> None:
+        import re
+        executables = set()
+        service_names = set()
+        paths = set()
+        hashes = set()
+        users = set()
+        concepts = set()
+        timestamp = None
+        summary_parts = []
+
+        # Extract common fields
+        for val in entry.values():
+            if isinstance(val, str):
+                # Hash match
+                m_hash = re.findall(r'\b[a-fA-F0-9]{32}\b|\b[a-fA-F0-9]{40}\b|\b[a-fA-F0-9]{64}\b', val)
+                hashes.update([h.lower() for h in m_hash])
+                # Executable match
+                m_exes = re.findall(r'\b([\w\.-]+\.(?:exe|dll|sys|bat|ps1|vbs|bin))\b', val.lower())
+                executables.update(m_exes)
+
+        # Normalize specific tools
+        artifact_family = get_source_artifact_class(tool_name)
+
+        if tool_name == "analyze_amcache":
+            file_name = entry.get("file_name") or ""
+            full_path = entry.get("full_path") or ""
+            sha1 = entry.get("sha1") or ""
+            timestamp = entry.get("first_run") or entry.get("last_modified")
+
+            if file_name:
+                executables.add(file_name.lower())
+            if full_path:
+                paths.add(full_path.lower())
+                executables.add(os.path.basename(full_path).lower())
+            if sha1:
+                hashes.add(sha1.lower())
+            summary_parts.append(f"Amcache entry for {file_name or full_path}")
+            concepts.add("execution")
+
+        elif tool_name == "analyze_shimcache":
+            path = entry.get("path") or ""
+            timestamp = entry.get("last_modified_time")
+            if path:
+                paths.add(path.lower())
+                executables.add(os.path.basename(path).lower())
+            summary_parts.append(f"Shimcache entry for {path}")
+            concepts.add("execution")
+
+        elif tool_name == "analyze_prefetch":
+            executable = entry.get("executable") or entry.get("source_file") or ""
+            timestamp = entry.get("last_run")
+            if executable:
+                executables.add(executable.lower())
+            summary_parts.append(f"Prefetch execution of {executable}")
+            concepts.add("execution")
+
+        elif tool_name == "analyze_services":
+            service_name = entry.get("service_name") or ""
+            display_name = entry.get("display_name") or ""
+            image_path = entry.get("image_path") or ""
+
+            if service_name:
+                service_names.add(service_name.lower())
+            if display_name:
+                service_names.add(display_name.lower())
+            if image_path:
+                paths.add(image_path.lower())
+                m_exes = re.findall(r'\b([\w\.-]+\.(?:exe|dll|sys|bat|ps1|vbs|bin))\b', image_path.lower())
+                executables.update(m_exes)
+            summary_parts.append(f"Windows service {service_name} registered ({image_path})")
+            concepts.add("services")
+            concepts.add("persistence")
+
+        elif tool_name == "analyze_sysmon":
+            eid = str(entry.get("event_id", ""))
+            timestamp = entry.get("timestamp")
+
+            image = entry.get("image") or ""
+            cmd = entry.get("command_line") or ""
+            user = entry.get("user") or ""
+
+            if image:
+                executables.add(os.path.basename(image).lower())
+                paths.add(image.lower())
+            if cmd:
+                m_exes = re.findall(r'\b([\w\.-]+\.(?:exe|dll|sys|bat|ps1|vbs|bin))\b', cmd.lower())
+                executables.update(m_exes)
+            if user:
+                users.add(user.lower())
+            summary_parts.append(f"Sysmon Event {eid} observed")
+            concepts.add("sysmon")
+            if eid == "1":
+                concepts.add("execution")
+            elif eid == "3":
+                concepts.add("network")
+
+        elif tool_name == "analyze_evtx":
+            eid = str(entry.get("event_id", ""))
+            timestamp = entry.get("timestamp")
+
+            if eid == "7045":
+                service_name = entry.get("service_name") or ""
+                image_path = entry.get("image_path") or ""
+                if service_name:
+                    service_names.add(service_name.lower())
+                if image_path:
+                    paths.add(image_path.lower())
+                    m_exes = re.findall(r'\b([\w\.-]+\.(?:exe|dll|sys|bat|ps1|vbs|bin))\b', image_path.lower())
+                    executables.update(m_exes)
+                summary_parts.append(f"EVTX Service Creation: {service_name}")
+                concepts.add("services")
+                concepts.add("persistence")
+            else:
+                summary_parts.append(f"EVTX Event {eid} observed")
+                if eid in ["4624", "4625"]:
+                    concepts.add("logon")
+
+        elif tool_name == "analyze_powershell_logs":
+            eid = str(entry.get("event_id", ""))
+            timestamp = entry.get("timestamp")
+            script_text = entry.get("script_block_text", "") or ""
+            if script_text:
+                m_exes = re.findall(r'\b([\w\.-]+\.(?:exe|dll|sys|bat|ps1|vbs|bin))\b', script_text.lower())
+                executables.update(m_exes)
+            summary_parts.append(f"PowerShell Log Event {eid} observed")
+            concepts.add("powershell")
+            concepts.add("execution")
+
+        elif tool_name == "analyze_autoruns":
+            entry_name = entry.get("entry") or ""
+            launch_str = entry.get("launch_string") or ""
+            path = entry.get("path") or ""
+
+            if entry_name:
+                service_names.add(entry_name.lower())
+            if launch_str:
+                paths.add(launch_str.lower())
+                m_exes = re.findall(r'\b([\w\.-]+\.(?:exe|dll|sys|bat|ps1|vbs|bin))\b', launch_str.lower())
+                executables.update(m_exes)
+            if path:
+                paths.add(path.lower())
+            summary_parts.append(f"Autorun entry: {entry_name} -> {launch_str}")
+            concepts.add("autoruns")
+            concepts.add("persistence")
+
+        elif tool_name == "analyze_scheduled_tasks":
+            task_name = entry.get("task_name") or ""
+            action = entry.get("action") or ""
+            path = entry.get("path") or ""
+
+            if task_name:
+                service_names.add(task_name.lower())
+            if action:
+                m_exes = re.findall(r'\b([\w\.-]+\.(?:exe|dll|sys|bat|ps1|vbs|bin))\b', action.lower())
+                executables.update(m_exes)
+            if path:
+                paths.add(path.lower())
+            summary_parts.append(f"Scheduled task: {task_name} -> {action}")
+            concepts.add("scheduled_tasks")
+            concepts.add("persistence")
+
+        elif tool_name == "analyze_sam_users":
+            username = entry.get("username") or ""
+            if username:
+                users.add(username.lower())
+            summary_parts.append(f"SAM user account: {username}")
+            concepts.add("sam_users")
+
+        elif tool_name == "analyze_network_connections":
+            proto = entry.get("protocol") or ""
+            local_addr = entry.get("local_address") or ""
+            remote_addr = entry.get("remote_address") or ""
+            summary_parts.append(f"Network Connection: {proto} {local_addr} -> {remote_addr}")
+            concepts.add("network")
+
+        else:
+            summary_parts.append(f"Observed artifact in {tool_name}")
+
+        # Gather general entities
+        entities = set()
+        entities.update(executables)
+        entities.update(service_names)
+        entities.update(hashes)
+        entities.update(users)
+        for p in paths:
+            entities.add(os.path.basename(p))
+
+        self.add_item(ObservedEvidenceItem(
+            source_tool=tool_name,
+            artifact_family=artifact_family,
+            raw_entry=entry,
+            summary=" ".join(summary_parts),
+            entities=entities,
+            executables=executables,
+            service_names=service_names,
+            paths=paths,
+            hashes=hashes,
+            users=users,
+            timestamp=timestamp,
+            attack_concepts=concepts
+        ))
+
+
+def _is_narrow_fact(claim_text: str) -> bool:
+    """Check if the claim represents a narrow forensic fact."""
+    text = claim_text.lower()
+    narrow_keywords = [
+        "present on disk", "was registered as a windows service", "windows service registered",
+        "registered as a service", "file exists", "path was", "key was", "created at",
+        "modified at", "hash is", "sha1", "entry existed", "was present", "file is present",
+        "was registered", "created service", "scheduled task registered"
+    ]
+    return any(kw in text for kw in narrow_keywords) or "registered as a Windows service" in claim_text
+
+
+def _is_broad_interpretation(claim_text: str) -> bool:
+    """Check if the claim represents a broad attack interpretation."""
+    text = claim_text.lower()
+    broad_keywords = [
+        "was used for", "remote execution", "lateral movement", "compromise", "adversary",
+        "psexec-style remote execution is suspected", "credential dumping activity",
+        "powershell download/execution suspected", "persistence via", "execution suspected",
+        "suspicious execution", "exfiltration", "malicious activity"
+    ]
+    return any(kw in text for kw in broad_keywords)
+
+
+def _split_broad_claim(claim_text: str) -> list[str]:
+    """Split broad attack interpretations into narrow forensic facts and broad suspected claims."""
+    text_lower = claim_text.lower()
+
+    if "psexec" in text_lower or "psexesvc" in text_lower:
+        if any(kw in text_lower for kw in ["used for", "persistence", "remote execution", "installed"]):
+            return [
+                "PSEXESVC.exe was present on disk.",
+                "PSEXESVC was registered as a Windows service.",
+                "PsExec-style remote execution is suspected."
+            ]
+
+    if "mimikatz" in text_lower or "pwdump" in text_lower:
+        if any(kw in text_lower for kw in ["used to", "used for", "dump credentials", "credential dumping"]):
+            return [
+                "PWDumpX/mimikatz credential dumper was present on disk.",
+                "Credential dumping activity was suspected/observed."
+            ]
+
+    if "scheduled task" in text_lower or "schtasks" in text_lower:
+        if "persistence" in text_lower or "used for" in text_lower:
+            return [
+                "A scheduled task was created.",
+                "Persistence via scheduled task is suspected."
+            ]
+
+    return [claim_text]
+
+
+def _is_direct_match_strict(eo: EvidenceObject, item: ObservedEvidenceItem) -> bool:
+    """Determine if an observed evidence item strictly directly disproves or supports a finding claim."""
+    claim_text = eo.claim.lower()
+
+    # 1. Executable name match
+    pos_exes = _extract_executables_and_tools(eo.claim)
+    for obs in eo.supporting_observations:
+        pos_exes.update(_extract_executables_and_tools(obs))
+
+    if pos_exes and item.executables:
+        common_exes = pos_exes.intersection(item.executables)
+        if common_exes:
+            return True
+
+    # 2. Service name match
+    if item.service_names:
+        words = re.findall(r'\b[a-zA-Z0-9_-]{4,}\b', claim_text)
+        for w in words:
+            if w in ["execution", "service", "registered", "present", "disk", "remote", "suspected", "lateral", "movement"]:
+                continue
+            if w in item.service_names:
+                return True
+
+    # 3. Full path match
+    claim_paths = re.findall(r'\b[\w\.-]+[\\/][\w\.-]+[\\/\w\.-]*', claim_text)
+    if claim_paths and item.paths:
+        claim_paths_clean = {p.lower() for p in claim_paths}
+        if claim_paths_clean.intersection(item.paths):
+            return True
+
+    # 4. Hash match
+    claim_hashes = re.findall(r'\b[a-fA-F0-9]{32}\b|\b[a-fA-F0-9]{40}\b|\b[a-fA-F0-9]{64}\b', claim_text)
+    if claim_hashes and item.hashes:
+        claim_hashes_clean = {h.lower() for h in claim_hashes}
+        if claim_hashes_clean.intersection(item.hashes):
+            return True
+
+    # 5. Username match
+    if item.users:
+        for u in item.users:
+            if re.search(rf'\b{u}\b', claim_text):
+                return True
+
+    # 6. Precise attack concept + concrete entity
+    if "sysmon" in claim_text and "sysmon" in item.attack_concepts:
+        shared = [ent for ent in item.entities if ent in claim_text]
+        if shared and not any(s in ["sysmon", "exe", "sysmon64", "xml"] for s in shared):
+            return True
+
+    if "scheduled task" in claim_text and "scheduled_tasks" in item.attack_concepts:
+        shared = [ent for ent in item.entities if ent in claim_text]
+        if shared:
+            return True
+
+    return False
+
+
+def auto_corroborate_all_findings(correlator: "EvidenceCorrelator", observed_store: ObservedEvidenceStore) -> None:
+    """Scan each finding and attach previously observed evidence only when there is a direct match."""
+    for eo in correlator.get_all():
+        for item in observed_store.items:
+            if _is_direct_match_strict(eo, item):
+                source = item.source_tool
+                if source and source not in eo.evidence_sources:
+                    eo.evidence_sources.append(source)
+
+                obs_summary = f"Direct observation from {source}: {item.summary}"
+                if obs_summary not in eo.supporting_observations:
+                    eo.supporting_observations.append(obs_summary)
+
+                if item.raw_entry not in eo.artifacts:
+                    eo.artifacts.append(item.raw_entry)
+
+                eo.updated_at = datetime.now(timezone.utc).isoformat()
+                eo.confidence_score = correlator._calculate_confidence(eo)
+                eo.attack_mappings = MitreAttackMapper.map_finding(eo.claim, eo.evidence_sources, eo.supporting_observations)
 
 
 class EvidenceCorrelator:
@@ -367,6 +860,7 @@ class EvidenceCorrelator:
     def __init__(self) -> None:
         self.evidence: dict[str, EvidenceObject] = {}
         self._hypothesis_counter = 0
+        self.observed_store = ObservedEvidenceStore()
 
     def _next_hypothesis_id(self) -> str:
         self._hypothesis_counter += 1
@@ -377,10 +871,11 @@ class EvidenceCorrelator:
                         supporting: str = "") -> EvidenceObject:
         """Create a new evidence object for a forensic claim."""
         now = datetime.now(timezone.utc).isoformat()
+        sources = _parse_sources(source)
         eo = EvidenceObject(
             finding_id=str(uuid.uuid4())[:8],
             claim=claim,
-            evidence_sources=[source] if source else [],
+            evidence_sources=sources,
             artifacts=[artifact] if artifact else [],
             supporting_observations=[supporting] if supporting else [],
             hypothesis_id=self._next_hypothesis_id(),
@@ -388,7 +883,7 @@ class EvidenceCorrelator:
             updated_at=now,
         )
         eo.confidence_score = self._calculate_confidence(eo)
-        eo.attack_mappings = MitreAttackMapper.map_finding(eo.claim, eo.evidence_sources)
+        eo.attack_mappings = MitreAttackMapper.map_finding(eo.claim, eo.evidence_sources, eo.supporting_observations)
         self.evidence[eo.finding_id] = eo
         return eo
 
@@ -399,15 +894,16 @@ class EvidenceCorrelator:
         eo = self.evidence.get(finding_id)
         if not eo:
             return 0.0
-        if source and source not in eo.evidence_sources:
-            eo.evidence_sources.append(source)
+        for src in _parse_sources(source):
+            if src and src not in eo.evidence_sources:
+                eo.evidence_sources.append(src)
         if observation:
             eo.supporting_observations.append(observation)
         if artifact:
             eo.artifacts.append(artifact)
         eo.updated_at = datetime.now(timezone.utc).isoformat()
         eo.confidence_score = self._calculate_confidence(eo)
-        eo.attack_mappings = MitreAttackMapper.map_finding(eo.claim, eo.evidence_sources)
+        eo.attack_mappings = MitreAttackMapper.map_finding(eo.claim, eo.evidence_sources, eo.supporting_observations)
         return eo.confidence_score
 
     def add_contradiction(self, finding_id: str, observation: str, logger: Any = None) -> float:
@@ -418,7 +914,7 @@ class EvidenceCorrelator:
         eo.contradictory_observations.append(observation)
         eo.updated_at = datetime.now(timezone.utc).isoformat()
         eo.confidence_score = self._calculate_confidence(eo)
-        
+
         # Create a new child hypothesis branch
         child_claim = f"Alternative explanation for contradiction in {eo.hypothesis_id}: {observation}"
         now = datetime.now(timezone.utc).isoformat()
@@ -433,12 +929,12 @@ class EvidenceCorrelator:
             updated_at=now,
         )
         child_eo.confidence_score = self._calculate_confidence(child_eo)
-        child_eo.attack_mappings = MitreAttackMapper.map_finding(child_eo.claim, child_eo.evidence_sources)
+        child_eo.attack_mappings = MitreAttackMapper.map_finding(child_eo.claim, child_eo.evidence_sources, child_eo.supporting_observations)
         self.evidence[child_eo.finding_id] = child_eo
-        
+
         if logger:
             logger.log_evidence_created(child_eo)
-            
+
         return eo.confidence_score
 
     def record_verification(self, finding_id: str, action: str,
@@ -470,16 +966,66 @@ class EvidenceCorrelator:
             eo.updated_at = datetime.now(timezone.utc).isoformat()
 
     def find_related(self, claim_text: str) -> list[EvidenceObject]:
-        """Find evidence objects whose claims overlap with the given claim_text by sharing specific entities."""
+        """Find evidence objects whose claims overlap with the given claim_text by sharing specific entities, executables, or attack claims."""
         results = []
+        new_exes = _extract_executables_and_tools(claim_text)
+
+        def get_attack_claims(text: str) -> set[str]:
+            text_lower = text.lower()
+            concepts = set()
+            if any(kw in text_lower for kw in ["pwdump", "pwdumpx", "mimikatz", "credential dump", "lsass"]):
+                concepts.add("credential_dumping")
+            if any(kw in text_lower for kw in ["schtasks", "scheduled task", "task scheduler"]):
+                concepts.add("scheduled_tasks")
+            if any(kw in text_lower for kw in ["service", "psexesvc"]):
+                concepts.add("services")
+            if any(kw in text_lower for kw in ["psexec", "lateral movement", "rdp", "remote desktop"]):
+                concepts.add("lateral_movement")
+            if any(kw in text_lower for kw in ["powershell", "ps1"]):
+                concepts.add("powershell")
+            if any(kw in text_lower for kw in ["cmd.exe", "cmd"]):
+                concepts.add("cmd")
+            if any(kw in text_lower for kw in ["registry run", "run key", "startup folder", "reg.exe", "reg"]):
+                concepts.add("registry")
+            return concepts
+
+        new_concepts = get_attack_claims(claim_text)
         new_entities = _extract_specific_entities(claim_text)
-        if not new_entities:
-            return []
-            
+
         for eo in self.evidence.values():
-            eo_entities = _extract_specific_entities(eo.claim)
-            if new_entities.intersection(eo_entities):
-                results.append(eo)
+            eo_exes = _extract_executables_and_tools(eo.claim)
+            eo_concepts = get_attack_claims(eo.claim)
+
+            # Check for executable overlap
+            exe_overlap = new_exes.intersection(eo_exes)
+            concept_overlap = new_concepts.intersection(eo_concepts)
+
+            is_related = False
+
+            if exe_overlap:
+                is_related = True
+            elif concept_overlap:
+                is_related = True
+            else:
+                # If they do not share a specific executable or a precise concept/attack claim,
+                # we do NOT merge them, even if they share generic entities like 'system' or 'administrator' or '.exe'.
+                is_related = False
+
+            # If both mention tools from the distinct list, they must share the specific executable or precise attack claim.
+            # E.g. PWDumpX vs PowerShell vs PsExec vs cmd.exe vs schtasks.exe vs reg.exe
+            distinct_categories = ["pwdump", "powershell", "cmd", "schtasks", "psexec", "reg"]
+            claim_cats = {cat for cat in distinct_categories if any(cat in val for val in new_exes) or re.search(rf'\b{cat}\b', claim_text.lower())}
+            eo_cats = {cat for cat in distinct_categories if any(cat in val for val in eo_exes) or re.search(rf'\b{cat}\b', eo.claim.lower())}
+
+            if claim_cats and eo_cats and claim_cats != eo_cats:
+                # Different tools mentioned! Do not merge unless they share the same precise attack claim.
+                if not concept_overlap:
+                    is_related = False
+
+            if is_related:
+                eo_entities = _extract_specific_entities(eo.claim)
+                if new_entities.intersection(eo_entities) or exe_overlap or concept_overlap:
+                    results.append(eo)
         return results
 
     def get_all(self) -> list[EvidenceObject]:
@@ -505,38 +1051,85 @@ class EvidenceCorrelator:
         }
 
     def _calculate_confidence(self, eo: EvidenceObject) -> float:
-        """Calculate confidence based on source count and modifiers."""
-        unique_sources = set(eo.evidence_sources)
-        
-        # Categorize each source used
-        artifact_classes = set()
+        """Calculate confidence based on source count and directness modifiers."""
+        direct_sources = set()
         for src in eo.evidence_sources:
+            for item in self.observed_store.items:
+                if item.source_tool == src:
+                    if _is_direct_match_strict(eo, item):
+                        direct_sources.add(src)
+                        break
+
+        unique_sources = set(eo.evidence_sources)
+        indirect_sources = unique_sources.difference(direct_sources)
+
+        artifact_families = set()
+        for src in direct_sources:
             cls = get_source_artifact_class(src, eo.claim + " " + " ".join(eo.supporting_observations))
-            artifact_classes.add(cls)
-            
-        n_sources = len(unique_sources)
-        n_classes = len(artifact_classes)
-        
-        # Base score based on independent source count and class diversity
-        if n_sources >= 3 and n_classes >= 2:
+            artifact_families.add(cls)
+
+        n_direct = len(direct_sources)
+        n_families = len(artifact_families)
+
+        # Base confidence calculation based on direct independent sources
+        # * 1 direct source: low confidence
+        # * 2 direct independent sources: medium confidence
+        # * 3+ direct independent sources across artifact families: high confidence
+        if n_direct >= 3 and n_families >= 2:
             base = 0.75
-        elif n_sources == 2:
+        elif n_direct == 2:
             base = 0.50
-        elif n_sources == 1:
+        elif n_direct == 1:
             base = 0.25
         else:
             base = 0.10
 
-        # Supporting observations beyond the base source count add small boosts
-        extra_support = max(0, len(eo.supporting_observations) - n_sources)
-        base += extra_support * 0.05
+        # Indirect / generic sources add little or no confidence
+        base += len(indirect_sources) * 0.02
 
-        # Contradictions reduce confidence
+        # Supporting observations beyond base direct sources add small boost
+        extra_support = max(0, len(eo.supporting_observations) - n_direct)
+        base += extra_support * 0.02
+
+        # Contradictions directly conflicting reduce confidence
         base -= len(eo.contradictory_observations) * 0.15
 
-        # Cap single-artifact findings to 0.30 (LOW)
-        if n_sources <= 1:
-            base = min(base, 0.30)
+        # Apply verification modifier based on status
+        if eo.status == "verified":
+            base += 0.10
+        elif eo.status in ("refuted", "inconclusive"):
+            base -= 0.10
+
+        # Caps:
+        claim_lower = eo.claim.lower()
+
+        # * Narrow facts with 3+ direct independent artifacts may reach 0.70-0.85
+        if _is_narrow_fact(eo.claim):
+            if n_direct >= 3:
+                base = min(max(0.70, base), 0.85)
+            elif n_direct == 2:
+                base = min(base, 0.65)
+            else:
+                base = min(base, 0.30)
+        # * Broad interpretation claims should cap around 0.55 unless directly supported
+        elif _is_broad_interpretation(eo.claim):
+            has_direct_support = any(src in direct_sources for src in ["analyze_sysmon", "analyze_evtx", "run_tshark_summary", "analyze_powershell_logs", "analyze_prefetch"])
+            if not has_direct_support:
+                base = min(base, 0.55)
+            else:
+                base = min(base, 0.70)
+
+        # * Lateral movement claims should cap around 0.35 unless supported by Logon Type 3/10 or network/Sysmon
+        if "lateral movement" in claim_lower:
+            has_logon = any(type_str in claim_lower or any(type_str in obs.lower() for obs in eo.supporting_observations)
+                            for type_str in ["logon type 3", "logon type 10", "type 3", "type 10"])
+            has_network = "run_tshark_summary" in direct_sources or "analyze_network_connections" in direct_sources
+            has_sysmon_net = "analyze_sysmon" in direct_sources and any("network" in obs.lower() for obs in eo.supporting_observations)
+
+            if not (has_logon or has_network or has_sysmon_net):
+                base = min(base, 0.35)
+            else:
+                base = min(base, 0.60)
 
         return max(0.0, min(1.0, base))
 
@@ -678,17 +1271,43 @@ def get_source_artifact_class(source: str, context: str = "") -> str:
     Categorize forensic tools/evidence sources into specific DFIR artifact classes.
     """
     source_lower = source.lower()
+
+    if "analyze_amcache" in source_lower:
+        return "amcache"
+    if "analyze_shimcache" in source_lower:
+        return "shimcache"
+    if "analyze_prefetch" in source_lower:
+        return "prefetch"
+    if "analyze_services" in source_lower:
+        return "services_registry"
+    if "analyze_sysmon" in source_lower:
+        return "sysmon_event_log"
+    if "analyze_powershell_logs" in source_lower:
+        return "powershell_event_log"
+    if "analyze_evtx" in source_lower:
+        return "windows_event_log"
+    if "analyze_autoruns" in source_lower:
+        return "autoruns"
+    if "analyze_scheduled_tasks" in source_lower:
+        return "scheduled_tasks"
+    if "analyze_network_connections" in source_lower or "run_tshark_summary" in source_lower:
+        return "network"
+    if "analyze_mft" in source_lower:
+        return "mft"
+    if "analyze_usn_journal" in source_lower:
+        return "usn_journal"
+    if "analyze_sam_users" in source_lower:
+        return "sam_users"
+
+    # Fallback to context or generic mapping
     context_lower = context.lower()
-    
     if any(k in source_lower for k in ["tshark", "pcap", "network"]) or any(k in context_lower for k in ["lateral movement", "rdp", "smb", "winrm", "psexec"]):
-        return "lateral_movement_artifacts"
-    
+        return "network"
     if any(k in context_lower for k in ["persistence", "autorun", "service creation", "scheduled task", "schtasks", "run key", "startup folder"]):
         return "persistence_artifacts"
-        
     if any(k in context_lower for k in ["privilege escalation", "bypass uac", "administrator", "special privilege", "4672", "system privilege"]):
         return "privilege_escalation_artifacts"
-        
+
     return "execution_artifacts"
 
 
@@ -698,39 +1317,40 @@ def _generate_corroboration_prompt(evidence: EvidenceObject) -> str:
     based on its predicted artifact class.
     """
     cls = get_source_artifact_class(evidence.claim, evidence.claim + " " + " ".join(evidence.supporting_observations))
-    
+
     prompt = (
         f"The finding '{evidence.claim}' currently has LOW confidence ({evidence.confidence_score:.0%}). "
         f"To verify this claim, you should gather corroborating evidence from another independent source. "
     )
-    
-    if cls == "execution_artifacts":
+
+    if cls in ("execution_artifacts", "amcache", "shimcache", "prefetch"):
         prompt += (
             "Since this is an execution claim, run analyze_prefetch, analyze_amcache, "
             "analyze_shimcache, analyze_userassist, or analyze_recentapps. For example, "
             "if you only checked Prefetch, run analyze_amcache or analyze_shimcache to see "
             "if the program is registered there."
         )
-    elif cls == "persistence_artifacts":
+    elif cls in ("persistence_artifacts", "services_registry", "autoruns", "scheduled_tasks"):
         prompt += (
             "Since this is a persistence claim, run analyze_evtx (log_name='System', event_ids='7045') "
-            "to check for service installations, or run analyze_usn_journal to check for "
-            "creation of files in startup folders or system directories."
+            "to check for service installations, analyze_scheduled_tasks, or analyze_autoruns. "
+            "If you need USN Journal data, use analyze_usn_journal with a specific filename_filter "
+            "(e.g. the suspicious executable name). Do NOT run broad USN or MFT scans without filters."
         )
-    elif cls == "lateral_movement_artifacts":
+    elif cls in ("lateral_movement_artifacts", "network"):
         prompt += (
             "Since this is a lateral movement claim, run run_tshark_summary to check network packets, "
             "or run analyze_evtx (log_name='Security', event_ids='4624,4625') to search for "
             "successful or failed remote logon events (Logon Type 3 or 10)."
         )
-    elif cls == "privilege_escalation_artifacts":
+    elif cls in ("privilege_escalation_artifacts",):
         prompt += (
             "Since this is a privilege escalation claim, run analyze_evtx (log_name='Security', event_ids='4672') "
             "to check for special privilege assignments, or check analyze_sysmon for process injection (Event ID 8)."
         )
     else:
         prompt += "Run alternative registry or event log analysis tools to find corroborating events."
-        
+
     return prompt
 
 
@@ -773,16 +1393,17 @@ class ForensicTimeline:
         self.contradictions: list[str] = []
         self._last_score: float = 1.0
 
-    def add_events_from_tool_output(self, tool_name: str, result_str: str) -> None:
+    def add_events_from_tool_output(self, tool_name: str, result_str: Any) -> None:
         """Parses tool output JSON and extracts timestamped events."""
         try:
-            data = json.loads(result_str)
+            raw_text = _extract_text_content(result_str)
+            data = json.loads(raw_text)
             if not isinstance(data, dict):
                 return
             entries = data.get("entries", [])
             if not isinstance(entries, list):
                 return
-                
+
             for entry in entries:
                 if tool_name == "analyze_prefetch":
                     exec_name = entry.get("executable") or entry.get("source_file", "Unknown")
@@ -791,46 +1412,46 @@ class ForensicTimeline:
                     for prev in entry.get("previous_runs", []):
                         if prev:
                             self._add_event(prev, "prefetch_execution", f"Previous Prefetch execution of {exec_name}", {"executable": exec_name})
-                            
+
                 elif tool_name == "analyze_amcache":
                     file_name = entry.get("file_name") or entry.get("full_path", "Unknown")
                     if entry.get("first_run"):
                         self._add_event(entry["first_run"], "amcache_first_run", f"Amcache first run/install of {file_name}", {"file": file_name, "sha1": entry.get("sha1")})
-                        
+
                 elif tool_name == "analyze_shimcache":
                     path = entry.get("path") or "Unknown"
                     if entry.get("last_modified_time"):
                         self._add_event(entry["last_modified_time"], "shimcache_modified", f"Shimcache last modified for {path}", {"path": path})
-                        
+
                 elif tool_name == "analyze_userassist":
                     prog = entry.get("program_name") or "Unknown"
                     user = entry.get("username", "Unknown")
                     if entry.get("last_executed"):
                         self._add_event(entry["last_executed"], "userassist_execution", f"UserAssist execution of {prog} by {user}", {"program": prog, "user": user, "run_count": entry.get("run_count")})
-                        
+
                 elif tool_name == "analyze_recentapps":
                     app = entry.get("app_path") or entry.get("app_id", "Unknown")
                     user = entry.get("username", "Unknown")
                     if entry.get("last_accessed"):
                         self._add_event(entry["last_accessed"], "recentapps_access", f"RecentApps access of {app} by {user}", {"app": app, "user": user})
-                        
+
                 elif tool_name == "analyze_sysmon":
                     eid = entry.get("event_id")
                     desc = entry.get("map_description") or f"Sysmon Event {eid}"
                     if entry.get("timestamp"):
                         self._add_event(entry["timestamp"], f"sysmon_{eid}", f"Sysmon [{eid}] {desc} - {entry.get('payload', '')[:100]}", entry)
-                        
+
                 elif tool_name == "analyze_evtx":
                     eid = entry.get("event_id")
                     desc = entry.get("map_description") or f"Event Log {eid}"
                     if entry.get("timestamp"):
                         self._add_event(entry["timestamp"], f"evtx_{eid}", f"EventLog [{eid}] {desc} - {entry.get('payload', '')[:100]}", entry)
-                        
+
                 elif tool_name == "analyze_powershell_logs":
                     eid = entry.get("event_id")
                     if entry.get("timestamp"):
                         self._add_event(entry["timestamp"], f"powershell_{eid}", f"PowerShell Event [{eid}] - {entry.get('script_block_text', '')[:100]}", entry)
-                        
+
                 elif tool_name == "analyze_usn_journal":
                     file_name = entry.get("file_name") or "Unknown"
                     reason = entry.get("update_reasons") or "Unknown"
@@ -864,7 +1485,7 @@ class ForensicTimeline:
             "%Y-%m-%dT%H:%M:%SZ",
             "%Y-%m-%dT%H:%M:%S",
         ]
-        
+
         ts_clean = ts_str.replace(" UTC", "").replace("Z", "")
         for fmt in formats:
             try:
@@ -901,11 +1522,11 @@ class ForensicTimeline:
 
         sorted_events = sorted(self.events, key=lambda x: x["timestamp"])
         file_lifecycle = {}
-        
+
         for ev in sorted_events:
             meta = ev["metadata"]
             ts = ev["timestamp"]
-            
+
             file_name = None
             if ev["event_type"] == "prefetch_execution":
                 file_name = meta.get("executable")
@@ -915,12 +1536,12 @@ class ForensicTimeline:
                 file_name = os.path.basename(meta.get("path", ""))
             elif ev["event_type"] == "usn_journal":
                 file_name = meta.get("file")
-                
+
             if file_name:
                 file_name = file_name.lower()
                 if file_name not in file_lifecycle:
                     file_lifecycle[file_name] = {}
-                
+
                 if ev["event_type"] in ("prefetch_execution", "amcache_first_run"):
                     file_lifecycle[file_name]["executed"] = ts
                 elif ev["event_type"] == "shimcache_modified":
@@ -937,7 +1558,7 @@ class ForensicTimeline:
             executed = lifecycle.get("executed")
             deleted = lifecycle.get("deleted")
             modified = lifecycle.get("modified")
-            
+
             if executed and created and executed < created:
                 self.contradictions.append(
                     f"Contradiction: File '{file_name}' executed at {executed} before creation at {created}."
@@ -971,56 +1592,78 @@ class MitreAttackMapper:
         {"keywords": ["phishing", "attachment", "email", "mail"], "tactic_id": "TA0001", "tactic_name": "Initial Access", "technique_id": "T1566", "technique_name": "Phishing"},
         {"keywords": ["vpn", "remote service", "remote access"], "tactic_id": "TA0001", "tactic_name": "Initial Access", "technique_id": "T1133", "technique_name": "External Remote Services"},
         {"keywords": ["valid account", "compromised credentials"], "tactic_id": "TA0001", "tactic_name": "Initial Access", "technique_id": "T1078", "technique_name": "Valid Accounts"},
-        
+
         # Execution
         {"keywords": ["powershell", "cmd.exe", "wmic", "scripting", "command line"], "tactic_id": "TA0002", "tactic_name": "Execution", "technique_id": "T1059", "technique_name": "Command and Scripting Interpreter"},
         {"keywords": ["user execution", "clicked", "opened file"], "tactic_id": "TA0002", "tactic_name": "Execution", "technique_id": "T1204", "technique_name": "User Execution"},
         {"keywords": ["wmi", "wmic process"], "tactic_id": "TA0002", "tactic_name": "Execution", "technique_id": "T1047", "technique_name": "Windows Management Instrumentation"},
-        
+        {"keywords": ["psexesvc", "psexec", "service execution"], "tactic_id": "TA0002", "tactic_name": "Execution", "technique_id": "T1569.002", "technique_name": "System Services: Service Execution"},
+        {"keywords": ["powershell download", "downloadfile", "script block", "sysmon64.exe delivery"], "tactic_id": "TA0002", "tactic_name": "Execution", "technique_id": "T1059.001", "technique_name": "Command and Scripting Interpreter: PowerShell"},
+
         # Persistence
         {"keywords": ["run key", "startup folder", "registry run"], "tactic_id": "TA0003", "tactic_name": "Persistence", "technique_id": "T1547.001", "technique_name": "Registry Run Keys / Startup Folder"},
-        {"keywords": ["scheduled task", "schtasks", "cron job"], "tactic_id": "TA0003", "tactic_name": "Persistence", "technique_id": "T1053", "technique_name": "Scheduled Task/Job"},
+        {"keywords": ["scheduled task", "update_sysmon_rules", "schtasks"], "tactic_id": "TA0003", "tactic_name": "Persistence", "technique_id": "T1053.005", "technique_name": "Scheduled Task/Job: Scheduled Task"},
         {"keywords": ["service creation", "installed service", "system service"], "tactic_id": "TA0003", "tactic_name": "Persistence", "technique_id": "T1543", "technique_name": "Create or Modify System Process"},
-        
+        {"keywords": ["registered as a service", "windows service", "service registration"], "tactic_id": "TA0003", "tactic_name": "Persistence", "technique_id": "T1543.003", "technique_name": "Create or Modify System Process: Windows Service"},
+
         # Privilege Escalation
         {"keywords": ["uac bypass", "bypass uac", "elevation control"], "tactic_id": "TA0004", "tactic_name": "Privilege Escalation", "technique_id": "T1548", "technique_name": "Abuse Elevation Control Mechanism"},
         {"keywords": ["process injection", "remote thread", "inject"], "tactic_id": "TA0004", "tactic_name": "Privilege Escalation", "technique_id": "T1055", "technique_name": "Process Injection"},
         {"keywords": ["token manipulation", "4672", "special privilege"], "tactic_id": "TA0004", "tactic_name": "Privilege Escalation", "technique_id": "T1134", "technique_name": "Token Manipulation"},
-        
+
         # Defense Evasion
         {"keywords": ["clear event", "wevtutil", "delete logs", "removal"], "tactic_id": "TA0005", "tactic_name": "Defense Evasion", "technique_id": "T1070", "technique_name": "Indicator Removal"},
         {"keywords": ["disable defender", "stop service", "impair defenses"], "tactic_id": "TA0005", "tactic_name": "Defense Evasion", "technique_id": "T1562", "technique_name": "Impair Defenses"},
         {"keywords": ["subvert trust", "trust controls"], "tactic_id": "TA0005", "tactic_name": "Defense Evasion", "technique_id": "T1553", "technique_name": "Subvert Trust Controls"},
-        
+
+        # Credential Access
+        {"keywords": ["pwdump", "pwdumpx", "credential dump", "sam dump", "lsass"], "tactic_id": "TA0006", "tactic_name": "Credential Access", "technique_id": "T1003", "technique_name": "OS Credential Dumping"},
+
         # Discovery
         {"keywords": ["systeminfo", "service discovery"], "tactic_id": "TA0007", "tactic_name": "Discovery", "technique_id": "T1007", "technique_name": "System Service Discovery"},
         {"keywords": ["net user", "account discovery"], "tactic_id": "TA0007", "tactic_name": "Discovery", "technique_id": "T1087", "technique_name": "Account Discovery"},
         {"keywords": ["find file", "directory discovery", "search"], "tactic_id": "TA0007", "tactic_name": "Discovery", "technique_id": "T1083", "technique_name": "File and Directory Discovery"},
-        
+
         # Lateral Movement
         {"keywords": ["rdp", "remote desktop"], "tactic_id": "TA0008", "tactic_name": "Lateral Movement", "technique_id": "T1021", "technique_name": "Remote Services"},
         {"keywords": ["psexec", "deployment tools"], "tactic_id": "TA0008", "tactic_name": "Lateral Movement", "technique_id": "T1072", "technique_name": "Software Deployment Tools"},
         {"keywords": ["pass the hash", "pth", "alternate authentication"], "tactic_id": "TA0008", "tactic_name": "Lateral Movement", "technique_id": "T1550", "technique_name": "Use Alternate Authentication Material"},
-        
+
         # Collection
         {"keywords": ["zip", "archive", "tar", "rar"], "tactic_id": "TA0009", "tactic_name": "Collection", "technique_id": "T1560", "technique_name": "Archive Collected Data"},
         {"keywords": ["mail collection", "pst", "email collection"], "tactic_id": "TA0009", "tactic_name": "Collection", "technique_id": "T1114", "technique_name": "Email Collection"},
         {"keywords": ["local system", "database dump"], "tactic_id": "TA0009", "tactic_name": "Collection", "technique_id": "T1005", "technique_name": "Data from Local System"},
-        
+
         # Exfiltration
         {"keywords": ["ftp", "sftp", "alternative protocol"], "tactic_id": "TA0010", "tactic_name": "Exfiltration", "technique_id": "T1048", "technique_name": "Exfiltration Over Alternative Protocol"},
         {"keywords": ["upload", "web service", "mega.nz"], "tactic_id": "TA0010", "tactic_name": "Exfiltration", "technique_id": "T1567", "technique_name": "Exfiltration Over Web Service"},
     ]
 
     @classmethod
-    def map_finding(cls, claim: str, sources: list[str]) -> list[dict[str, Any]]:
+    def map_finding(cls, claim: str, sources: list[str], supporting_observations: list[str] | None = None) -> list[dict[str, Any]]:
         mappings = []
-        claim_lower = claim.lower()
-        if not sources:
+        if not sources and not supporting_observations and not claim:
             return []
-            
+
+        claim_lower = claim.lower() if claim else ""
+        sources_lower = [s.lower() for s in sources] if sources else []
+        obs_lower = [obs.lower() for obs in supporting_observations] if supporting_observations else []
+
+        # Combine all finding context into a single string for mapping
+        full_context = claim_lower + " " + " ".join(sources_lower) + " " + " ".join(obs_lower)
+
         for rule in cls.MAPPING_RULES:
-            matched_kw = [kw for kw in rule["keywords"] if kw in claim_lower]
+            # Check evidence-based constraint for lateral movement:
+            # do not map lateral movement unless Logon Type 3/10 or network/Sysmon connection evidence supports it
+            if rule["tactic_id"] == "TA0008":
+                has_logon = any(ts in full_context for ts in ["logon type 3", "logon type 10", "type 3", "type 10"])
+                has_network = any(n in full_context for n in ["tshark", "pcap", "network connection"]) or "run_tshark_summary" in sources_lower or "analyze_network_connections" in sources_lower
+                has_sysmon_net = "analyze_sysmon" in sources_lower and any("network" in obs for obs in obs_lower)
+
+                if not (has_logon or has_network or has_sysmon_net):
+                    continue
+
+            matched_kw = [kw for kw in rule["keywords"] if kw in full_context]
             if matched_kw:
                 mappings.append({
                     "tactic_id": rule["tactic_id"],
@@ -1038,7 +1681,7 @@ def get_timeline_evidence_for_finding(eo: EvidenceObject, timeline: ForensicTime
     """
     words = re.findall(r"[\w.-]+\.\w{3}", eo.claim + " " + " ".join(eo.supporting_observations))
     words.extend(re.findall(r"\b(?:user|admin|administrator|sansforensics|guest|system)\b", eo.claim.lower()))
-    
+
     related_events = []
     seen_desc = set()
     for ev in timeline.get_chronological_events():
@@ -1051,13 +1694,42 @@ def get_timeline_evidence_for_finding(eo: EvidenceObject, timeline: ForensicTime
     return related_events[:5]
 
 
+def _parse_json_blocks_with_marker(text: str, marker: str, required_key: str) -> list[dict[str, Any]]:
+    results = []
+    idx = 0
+    text_lower = text.lower()
+    marker_lower = marker.lower()
+    while True:
+        pos = text_lower.find(marker_lower, idx)
+        if pos == -1:
+            break
+        # Find the next '{' after the marker
+        start_idx = text.find("{", pos + len(marker))
+        if start_idx == -1:
+            idx = pos + len(marker)
+            continue
+        try:
+            decoder = json.JSONDecoder()
+            obj, end = decoder.raw_decode(text[start_idx:])
+            if isinstance(obj, dict) and required_key in obj:
+                results.append(obj)
+            idx = start_idx + end
+        except (json.JSONDecodeError, ValueError):
+            idx = start_idx + 1
+    return results
+
+
 def _parse_investigation_plans(text: str) -> list[dict[str, Any]]:
     """
     Parse structured investigation plans from model output text.
-    Looks for ```investigation_plan ... ``` blocks containing JSON.
+    Looks for investigation_plan blocks containing JSON (fenced or unfenced).
     Returns a list of parsed plan dictionaries.
     """
-    plans: list[dict[str, Any]] = []
+    plans = _parse_json_blocks_with_marker(text, "investigation_plan", "hypothesis")
+    if plans:
+        return plans
+
+    plans = []
     pattern = r'```investigation_plan\s*\n(.*?)\n```'
     for match in re.finditer(pattern, text, re.DOTALL):
         try:
@@ -1077,17 +1749,21 @@ def _parse_investigation_plans(text: str) -> list[dict[str, Any]]:
 def _parse_evidence_claims(text: str) -> list[dict[str, str]]:
     """
     Parse structured evidence claims from model output text.
-    Looks for ```evidence_claim ... ``` blocks containing JSON.
+    Looks for evidence_claim blocks containing JSON (fenced or unfenced).
     Returns a list of parsed claim dictionaries.
     """
-    claims: list[dict[str, str]] = []
+    claims = _parse_json_blocks_with_marker(text, "evidence_claim", "claim")
+    if claims:
+        return [{str(k): str(v) for k, v in c.items()} for c in claims]
+
+    claims = []
     pattern = r'```evidence_claim\s*\n(.*?)\n```'
     for match in re.finditer(pattern, text, re.DOTALL):
         try:
             raw = match.group(1).strip()
             claim_data = json.loads(raw)
             if isinstance(claim_data, dict) and "claim" in claim_data:
-                claims.append(claim_data)
+                claims.append({str(k): str(v) for k, v in claim_data.items()})
         except (json.JSONDecodeError, ValueError):
             continue
     return claims
@@ -1096,9 +1772,13 @@ def _parse_evidence_claims(text: str) -> list[dict[str, str]]:
 def _parse_verification_result(text: str) -> dict[str, str] | None:
     """
     Parse a verification result block from model output.
-    Looks for ```verification_result ... ``` blocks containing JSON.
+    Looks for verification_result blocks containing JSON (fenced or unfenced).
     Returns the parsed result dictionary, or None if not found.
     """
+    results = _parse_json_blocks_with_marker(text, "verification_result", "status")
+    if results:
+        return {str(k): str(v) for k, v in results[0].items()}
+
     pattern = r'```verification_result\s*\n(.*?)\n```'
     match = re.search(pattern, text, re.DOTALL)
     if match:
@@ -1106,7 +1786,7 @@ def _parse_verification_result(text: str) -> dict[str, str] | None:
             raw = match.group(1).strip()
             result = json.loads(raw)
             if isinstance(result, dict) and "status" in result:
-                return result
+                return {str(k): str(v) for k, v in result.items()}
         except (json.JSONDecodeError, ValueError):
             pass
     return None
@@ -1129,7 +1809,7 @@ def _print_correlation_report(
     """
     if getattr(logger, "is_tool_validation", False):
         executed_tools = getattr(logger, "executed_tools", [])
-        
+
         tools_success = []
         tools_no_results = []
         tools_error = []
@@ -1140,7 +1820,7 @@ def _print_correlation_report(
                 tools_no_results.append(t)
             else:
                 tools_error.append(t)
-                
+
         print(f"\n{'='*80}")
         print(f"  TOOL VALIDATION REPORT")
         print(f"{'='*80}")
@@ -1151,7 +1831,7 @@ def _print_correlation_report(
         print(f"    No Results     : {len(tools_no_results)}")
         print(f"    Errors/Failed  : {len(tools_error)}")
         print()
-        
+
         print("  DETAILED TOOL RESULTS")
         print("  ---------------------")
         if tools_success:
@@ -1170,7 +1850,7 @@ def _print_correlation_report(
         print(f"{'-'*80}")
         print("  Tool validation completed successfully.")
         print(f"{'='*80}\n")
-        
+
         report_data = {
             "is_tool_validation": True,
             "total_tools_run": len(executed_tools),
@@ -1202,7 +1882,7 @@ def _print_correlation_report(
     print(f"\n{'='*80}")
     print(f"  UPGRADED FORENSIC CORRELATION & ATT&CK REPORT")
     print(f"{'='*80}")
-    
+
     print("  EXECUTIVE SUMMARY")
     print("  -----------------")
     print(f"    Total Findings : {summary['total_findings']}")
@@ -1217,7 +1897,7 @@ def _print_correlation_report(
     print(f"    Med Confidence : {conf_dist.get('medium', 0)}")
     print(f"    Low Confidence : {conf_dist.get('low', 0)}")
     print()
-    
+
     print("  MITRE ATT&CK SUMMARY")
     print("  --------------------")
     if not attack_counts:
@@ -1239,7 +1919,7 @@ def _print_correlation_report(
             for src in sorted(sources_used):
                 print(f"      * {src}")
             print()
-            
+
         executed_tools = getattr(logger, "executed_tools", [])
         if executed_tools:
             print("    MCP Tools Executed:")
@@ -1253,7 +1933,7 @@ def _print_correlation_report(
                     tools_no_results.append(t)
                 else:
                     tools_error.append(t)
-            
+
             print(f"      * Total Executed: {len(executed_tools)}")
             if tools_success:
                 print("      * Tools with entries:")
@@ -1331,6 +2011,13 @@ def _print_correlation_report(
         else:
             print(f"       |  None")
 
+        print(f"       +- Evidence Gaps ({len(getattr(eo, 'evidence_gaps', []))}):")
+        if getattr(eo, 'evidence_gaps', None):
+            for gap in eo.evidence_gaps[:3]:
+                print(f"       |  [GAP] {gap[:100]}")
+        else:
+            print(f"       |  None")
+
         print(f"       +- Verification Actions ({len(eo.verification_actions)}):")
         if eo.verification_actions:
             for act in eo.verification_actions[:5]:
@@ -1364,7 +2051,7 @@ def _print_correlation_report(
 
         # Final assessment
         if eo.status == "verified":
-            assessment = f"High-confidence evidence ({confidence_pct}). Finding corroborated."
+            assessment = f"{eo.confidence_label.title()}-confidence evidence ({confidence_pct}). Finding corroborated."
         elif eo.status == "refuted":
             assessment = f"Finding refuted. Contradictory evidence outweighs support."
         elif eo.status == "inconclusive":
@@ -1472,23 +2159,43 @@ class AuditLogger:
             payload["confidence_after"] = round(confidence_after, 2)
         self._write("tool_result", payload)
 
+        # Extract raw text from result, handling list or other types
+        raw_text = ""
+        if isinstance(result, str):
+            raw_text = result
+        elif isinstance(result, list):
+            parts = []
+            for part in result:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif hasattr(part, "text") and part.text:
+                    parts.append(part.text)
+                elif isinstance(part, dict) and "text" in part:
+                    parts.append(part["text"])
+            raw_text = "".join(parts)
+        else:
+            raw_text = str(result)
+
         status = "success"
         entries = None
-        if isinstance(result, str):
-            try:
-                data = json.loads(result)
-                if isinstance(data, dict):
-                    if "error" in data:
-                        status = "error"
-                    else:
-                        status = data.get("status", "success")
-                        entries = data.get("total_entries", None)
-            except Exception:
-                if "error" in result.lower() or "exception" in result.lower():
+        try:
+            data = json.loads(raw_text)
+            if isinstance(data, dict):
+                # Retrieve status first. success, timeout, and no_results are NOT errors
+                status = data.get("status", "success")
+                entries = data.get("total_entries", None)
+                if entries is None and "entries" in data and isinstance(data["entries"], list):
+                    entries = len(data["entries"])
+
+                # Check for "error" key, but status = success/timeout/no_results overrides error classification
+                if "error" in data and status not in ("success", "timeout", "no_results"):
                     status = "error"
-        else:
-            status = "error"
-            
+        except Exception:
+            if raw_text.startswith("Tool error:") or "exception" in raw_text.lower():
+                status = "error"
+            else:
+                status = "success"
+
         self.executed_tools.append({
             "tool_name": tool_name,
             "status": status,
@@ -2037,36 +2744,74 @@ async def run_agent(
                 print(f"\n[Iter {iteration}/{max_iterations}] Sending to model...")
 
                 import time as _time
-                _max_retries = 5
-                _retry = 0
-                while True:
-                    try:
-                        response = gemini_client.models.generate_content(
-                            model=GEMINI_MODEL,
-                            contents=contents,
-                            config=config,
-                        )
+                max_empty_retries = 3
+                empty_attempt = 0
+                response = None
+                is_empty = True
+
+                iter_i_tok = 0
+                iter_o_tok = 0
+                iter_cache_r = 0
+
+                while empty_attempt <= max_empty_retries:
+                    _max_retries = 5
+                    _retry = 0
+                    while True:
+                        try:
+                            response = gemini_client.models.generate_content(
+                                model=GEMINI_MODEL,
+                                contents=contents,
+                                config=config,
+                            )
+                            break
+                        except Exception as _e:
+                            err_str = str(_e)
+                            if any(code in err_str for code in ["429", "503", "500", "UNAVAILABLE"]) and _retry < _max_retries:
+                                _retry += 1
+                                import re as _re
+                                _match = _re.search(r"retry in (\d+)", err_str)
+                                _wait = int(_match.group(1)) + 10 if _match else (15 * _retry)
+                                print(f"  [API Transient Error] hit -- waiting {_wait}s before retry {_retry}/{_max_retries} (Error: {err_str[:80]})...")
+                                _time.sleep(_wait)
+                            else:
+                                raise
+
+                    # Token accounting for this attempt
+                    if response and response.usage_metadata:
+                        iter_i_tok += response.usage_metadata.prompt_token_count or 0
+                        iter_o_tok += response.usage_metadata.candidates_token_count or 0
+                        iter_cache_r = getattr(response.usage_metadata, "cached_content_token_count", 0) or 0
+
+                    # Check if response has text, tool calls, or usable parts
+                    is_empty = True
+                    if response and response.candidates:
+                        cand = response.candidates[0]
+                        if cand.content and cand.content.parts:
+                            for part in cand.content.parts:
+                                if part.text and part.text.strip():
+                                    is_empty = False
+                                    break
+                                if part.function_call:
+                                    is_empty = False
+                                    break
+
+                    if not is_empty:
                         break
-                    except Exception as _e:
-                        if "429" in str(_e) and _retry < _max_retries:
-                            _retry += 1
-                            import re as _re
-                            _match = _re.search(r"retry in (\d+)", str(_e))
-                            _wait = int(_match.group(1)) + 10 if _match else 60
-                            print(f"  [Rate limit] 429 hit -- waiting {_wait}s before retry {_retry}/{_max_retries}...")
-                            _time.sleep(_wait)
-                        else:
-                            raise
+
+                    empty_attempt += 1
+                    if empty_attempt <= max_empty_retries:
+                        print(f"Warning: Gemini returned empty response. Retrying iteration {iteration} (retry {empty_attempt}/{max_empty_retries})...")
+                        _time.sleep(5)
+
+                if is_empty:
+                    print("session incomplete due to empty model responses")
+                    sys.exit("session incomplete due to empty model responses")
 
                 # Token accounting
-                usage = response.usage_metadata
-                i_tok = usage.prompt_token_count or 0
-                o_tok = usage.candidates_token_count or 0
-                cache_r = getattr(usage, "cached_content_token_count", 0) or 0
-                total_input_tokens += i_tok
-                total_output_tokens += o_tok
-                logger.log_token_usage(iteration, i_tok, o_tok, cache_r, 0)
-                print(f"    Tokens -> in={i_tok}, out={o_tok}, "
+                total_input_tokens += iter_i_tok
+                total_output_tokens += iter_o_tok
+                logger.log_token_usage(iteration, iter_i_tok, iter_o_tok, iter_cache_r, 0)
+                print(f"    Tokens -> in={iter_i_tok}, out={iter_o_tok}, "
                       f"total_session={total_input_tokens + total_output_tokens}")
 
                 candidate = response.candidates[0]
@@ -2074,11 +2819,6 @@ async def run_agent(
 
                 # Collect text findings and detect function calls
                 function_calls = []
-                if not candidate.content or not candidate.content.parts:
-                    logger.log_agent_decision(iteration, "empty_response", 
-                        "Model returned empty content, skipping iteration.")
-                    print(f"  [Warning] Model returned empty response, continuing...")
-                    break
                 for part in candidate.content.parts:
                     if part.text:
                         all_findings.append(part.text.strip())
@@ -2100,50 +2840,86 @@ async def run_agent(
                         # --- Parse structured evidence claims ---
                         claims = [] if is_tool_validation else _parse_evidence_claims(part.text)
                         for claim_data in claims:
-                            claim_text = claim_data.get("claim", "")
+                            original_claim_text = claim_data.get("claim", "")
                             source = claim_data.get("source", "")
                             supporting = claim_data.get("supporting", "")
                             contradiction = claim_data.get("contradictions", "")
 
-                            # Check if this corroborates an existing finding
-                            related = correlator.find_related(claim_text) if claim_text else []
+                            if not original_claim_text:
+                                continue
 
-                            if related:
-                                # Corroborate the most relevant existing finding
-                                eo = related[0]
-                                old_conf = eo.confidence_score
-                                new_conf = correlator.add_corroboration(
-                                    eo.finding_id, source, supporting,
-                                )
-                                logger.log_confidence_update(
-                                    eo.finding_id, old_conf, new_conf,
-                                    f"Corroboration from {source or 'model reasoning'}",
-                                )
-                                print(f"  [Correlator] Corroborated {eo.hypothesis_id}: "
-                                      f"{old_conf:.0%} -> {new_conf:.0%}")
-                            else:
-                                # Create a new evidence object
-                                eo = correlator.create_evidence(
-                                    claim=claim_text,
-                                    source=source,
-                                    supporting=supporting,
-                                )
-                                logger.log_evidence_created(eo)
-                                print(f"  [Correlator] New evidence {eo.hypothesis_id}: "
-                                      f"'{claim_text[:50]}' ({eo.confidence_label})")
+                            split_claims = _split_broad_claim(original_claim_text)
+                            for claim_text in split_claims:
+                                if _is_absence_claim(claim_text):
+                                    # Do not create a separate finding for absence. Record on related finding only.
+                                    related = correlator.find_related(claim_text)
+                                    if related:
+                                        for eo in related:
+                                            gap_msg = f"Absence of evidence ({source}): {claim_text}. Context: {supporting}"
+                                            if not hasattr(eo, "evidence_gaps"):
+                                                eo.evidence_gaps = []
+                                            if gap_msg not in eo.evidence_gaps:
+                                                eo.evidence_gaps.append(gap_msg)
+                                                print(f"  [Correlator] Recorded evidence gap on {eo.hypothesis_id}: {claim_text}")
 
-                            # Handle contradictions
-                            if contradiction:
-                                old_conf = eo.confidence_score
-                                new_conf = correlator.add_contradiction(
-                                    eo.finding_id, contradiction, logger=logger
-                                )
-                                logger.log_confidence_update(
-                                    eo.finding_id, old_conf, new_conf,
-                                    f"Contradiction: {contradiction[:100]}",
-                                )
-                                print(f"  [Correlator] Contradiction on {eo.hypothesis_id}: "
-                                      f"{old_conf:.0%} -> {new_conf:.0%}")
+                                            # Only add to contradictory_observations if the absence directly disproves the positive claim
+                                            if _is_direct_disproof(eo.claim, claim_text):
+                                                if gap_msg not in eo.contradictory_observations:
+                                                    eo.contradictory_observations.append(gap_msg)
+                                                    print(f"  [Correlator] Recorded contradiction (direct disproof) on {eo.hypothesis_id}: {claim_text}")
+
+                                            eo.updated_at = datetime.now(timezone.utc).isoformat()
+                                            old_conf = eo.confidence_score
+                                            eo.confidence_score = correlator._calculate_confidence(eo)
+                                            eo.attack_mappings = MitreAttackMapper.map_finding(eo.claim, eo.evidence_sources, eo.supporting_observations)
+                                            logger.log_confidence_update(
+                                                eo.finding_id, old_conf, eo.confidence_score,
+                                                f"Absence claim recorded: {claim_text[:100]}"
+                                            )
+                                    continue
+
+                                # Check if this corroborates an existing finding
+                                related = correlator.find_related(claim_text)
+
+                                if related:
+                                    # Corroborate the most relevant existing finding
+                                    eo = related[0]
+                                    old_conf = eo.confidence_score
+                                    new_conf = correlator.add_corroboration(
+                                        eo.finding_id, source, supporting,
+                                    )
+                                    logger.log_confidence_update(
+                                        eo.finding_id, old_conf, new_conf,
+                                        f"Corroboration from {source or 'model reasoning'}",
+                                    )
+                                    print(f"  [Correlator] Corroborated {eo.hypothesis_id}: "
+                                          f"{old_conf:.0%} -> {new_conf:.0%}")
+                                else:
+                                    # Create a new evidence object
+                                    eo = correlator.create_evidence(
+                                        claim=claim_text,
+                                        source=source,
+                                        supporting=supporting,
+                                    )
+                                    logger.log_evidence_created(eo)
+                                    print(f"  [Correlator] New evidence {eo.hypothesis_id}: "
+                                          f"'{claim_text[:50]}' ({eo.confidence_label})")
+
+                                # Handle contradictions
+                                if contradiction:
+                                    old_conf = eo.confidence_score
+                                    new_conf = correlator.add_contradiction(
+                                        eo.finding_id, contradiction, logger=logger
+                                    )
+                                    logger.log_confidence_update(
+                                        eo.finding_id, old_conf, new_conf,
+                                        f"Contradiction: {contradiction[:100]}",
+                                    )
+                                    print(f"  [Correlator] Contradiction on {eo.hypothesis_id}: "
+                                          f"{old_conf:.0%} -> {new_conf:.0%}")
+
+                        # Run auto-corroboration after processing all claims
+                        auto_corroborate_all_findings(correlator, correlator.observed_store)
 
                     if part.function_call:
                         function_calls.append(part)
@@ -2189,8 +2965,12 @@ async def run_agent(
                               f"{str(result_content)[:300]}")
 
                         # Feed tool results to timeline
-                        timeline.add_events_from_tool_output(tool_name, str(result_content))
-                        
+                        timeline.add_events_from_tool_output(tool_name, result_content)
+
+                        # Populate observed store and run auto-corroboration
+                        correlator.observed_store.add_from_tool_output(tool_name, result_content)
+                        auto_corroborate_all_findings(correlator, correlator.observed_store)
+
                         # Check timeline consistency and apply penalties if it degrades
                         old_consistency = timeline._last_score
                         new_consistency = timeline.analyze_consistency()
@@ -2317,12 +3097,13 @@ async def run_agent(
                                 )
                                 break
                             except Exception as _e:
-                                if "429" in str(_e) and _retry < _max_retries:
+                                err_str = str(_e)
+                                if any(code in err_str for code in ["429", "503", "500", "UNAVAILABLE"]) and _retry < _max_retries:
                                     _retry += 1
                                     import re as _re
-                                    _match = _re.search(r"retry in (\d+)", str(_e))
-                                    _wait = int(_match.group(1)) + 10 if _match else 60
-                                    print(f"  [Rate limit] 429 hit -- waiting {_wait}s before retry {_retry}/{_max_retries}...")
+                                    _match = _re.search(r"retry in (\d+)", err_str)
+                                    _wait = int(_match.group(1)) + 10 if _match else (15 * _retry)
+                                    print(f"  [API Transient Error] hit -- waiting {_wait}s before retry {_retry}/{_max_retries} (Error: {err_str[:80]})...")
                                     _time.sleep(_wait)
                                 else:
                                     raise
@@ -2341,7 +3122,7 @@ async def run_agent(
                         # Process text and look for verification result
                         function_calls = []
                         if not candidate.content or not candidate.content.parts:
-                            logger.log_agent_decision(iteration, "empty_response", 
+                            logger.log_agent_decision(iteration, "empty_response",
                                 "Model returned empty content, skipping iteration.")
                             print(f"  [Warning] Model returned empty response, continuing...")
                             break
@@ -2351,9 +3132,65 @@ async def run_agent(
                                 print(f"\n  [Verifier]: {part.text[:300]}"
                                       + ("..." if len(part.text) > 300 else ""))
 
-                                # Check for verification result
+                                # 1. Parse and apply any new evidence claims from verification response first (corroborations)
+                                new_claims = _parse_evidence_claims(part.text)
+                                for nc in new_claims:
+                                    original_nc_claim = nc.get("claim", "")
+                                    nc_source = nc.get("source", "")
+                                    nc_supporting = nc.get("supporting", "")
+                                    if original_nc_claim:
+                                        split_nc_claims = _split_broad_claim(original_nc_claim)
+                                        for nc_claim in split_nc_claims:
+                                            if _is_absence_claim(nc_claim):
+                                                gap_msg = f"Absence of evidence ({nc_source}): {nc_claim}. Context: {nc_supporting}"
+                                                if not hasattr(eo, "evidence_gaps"):
+                                                    eo.evidence_gaps = []
+                                                if gap_msg not in eo.evidence_gaps:
+                                                    eo.evidence_gaps.append(gap_msg)
+                                                    print(f"  [Verification] Recorded evidence gap on {eo.hypothesis_id}: {nc_claim}")
+
+                                                if _is_direct_disproof(eo.claim, nc_claim):
+                                                    if gap_msg not in eo.contradictory_observations:
+                                                        eo.contradictory_observations.append(gap_msg)
+                                                        print(f"  [Verification] Recorded contradiction (direct disproof) on {eo.hypothesis_id}: {nc_claim}")
+
+                                                eo.updated_at = datetime.now(timezone.utc).isoformat()
+                                                old_conf = eo.confidence_score
+                                                eo.confidence_score = correlator._calculate_confidence(eo)
+                                                eo.attack_mappings = MitreAttackMapper.map_finding(eo.claim, eo.evidence_sources, eo.supporting_observations)
+                                                logger.log_confidence_update(
+                                                    eo.finding_id, old_conf, eo.confidence_score,
+                                                    f"Verification absence claim: {nc_claim[:100]}"
+                                                )
+                                            else:
+                                                old_conf = eo.confidence_score
+                                                new_conf = correlator.add_corroboration(
+                                                    eo.finding_id, nc_source, nc_supporting,
+                                                )
+                                                if old_conf != new_conf:
+                                                    logger.log_confidence_update(
+                                                        eo.finding_id, old_conf, new_conf,
+                                                        f"Verification corroboration: {nc_source}",
+                                                    )
+
+                                # Run auto-corroboration after processing verification claims
+                                auto_corroborate_all_findings(correlator, correlator.observed_store)
+
+                                # 2. Check for verification result block
                                 v_result = _parse_verification_result(part.text)
                                 if v_result:
+                                    # Ensure finding_id matches the current finding we are verifying
+                                    result_finding_id = v_result.get("finding_id")
+                                    if result_finding_id and result_finding_id != eo.finding_id:
+                                        print(f"  [Verification] Skipped verification block for unrelated finding {result_finding_id} (current: {eo.finding_id})")
+                                        continue
+
+                                    # Protect verified findings from being downgraded by later inconclusive blocks
+                                    if eo.status == "verified":
+                                        print(f"  [Verification] Finding {eo.hypothesis_id} is already verified. Ignoring status downgrade/change.")
+                                        verification_resolved = True
+                                        break
+
                                     old_conf = eo.confidence_score
                                     new_status = v_result.get("status", "inconclusive")
 
@@ -2361,12 +3198,7 @@ async def run_agent(
                                     if new_status not in ("verified", "refuted", "inconclusive"):
                                         new_status = "inconclusive"
 
-                                    # Hard rule: confidence_score < 0.25 blocks transition to verified status
-                                    if new_status == "verified" and eo.confidence_score < 0.25:
-                                        print(f"  [Verification] Blocked verification of {eo.hypothesis_id}: confidence too low ({eo.confidence_score:.2f} < 0.25)")
-                                        new_status = "inconclusive"
-
-                                    # Update confidence based on verification outcome
+                                    # Apply verification outcome bonus/penalty to confidence score FIRST
                                     if new_status == "verified":
                                         correlator.record_verification(
                                             eo.finding_id,
@@ -2379,7 +3211,6 @@ async def run_agent(
                                             v_result.get("reasoning", "Verification failed"),
                                             success=False,
                                         )
-                                        # Add any new contradictions
                                         new_contra = v_result.get("contradictions_found", "")
                                         if new_contra:
                                             correlator.add_contradiction(eo.finding_id, new_contra, logger=logger)
@@ -2389,6 +3220,11 @@ async def run_agent(
                                             v_result.get("reasoning", "Inconclusive"),
                                             success=False,
                                         )
+
+                                    # Hard rule: check confidence threshold AFTER applying verification outcome
+                                    if new_status == "verified" and eo.confidence_score < 0.25:
+                                        print(f"  [Verification] Blocked verification of {eo.hypothesis_id}: confidence too low ({eo.confidence_score:.2f} < 0.25)")
+                                        new_status = "inconclusive"
 
                                     correlator.finalize(eo.finding_id, new_status)
                                     new_conf = eo.confidence_score
@@ -2408,22 +3244,6 @@ async def run_agent(
                                     print(f"  [Verification] {eo.hypothesis_id}: "
                                           f"{new_status.upper()} ({old_conf:.0%} -> {new_conf:.0%})")
                                     verification_resolved = True
-
-                                # Also parse any new evidence claims from verification
-                                new_claims = _parse_evidence_claims(part.text)
-                                for nc in new_claims:
-                                    nc_claim = nc.get("claim", "")
-                                    nc_source = nc.get("source", "")
-                                    nc_supporting = nc.get("supporting", "")
-                                    old_conf = eo.confidence_score
-                                    new_conf = correlator.add_corroboration(
-                                        eo.finding_id, nc_source, nc_supporting,
-                                    )
-                                    if old_conf != new_conf:
-                                        logger.log_confidence_update(
-                                            eo.finding_id, old_conf, new_conf,
-                                            f"Verification corroboration: {nc_source}",
-                                        )
 
                             if part.function_call:
                                 function_calls.append(part)
@@ -2462,8 +3282,12 @@ async def run_agent(
                                           f"{str(result_content)[:300]}")
 
                                     # Feed tool results to timeline
-                                    timeline.add_events_from_tool_output(tool_name, str(result_content))
-                                    
+                                    timeline.add_events_from_tool_output(tool_name, result_content)
+
+                                    # Populate observed store and run auto-corroboration
+                                    correlator.observed_store.add_from_tool_output(tool_name, result_content)
+                                    auto_corroborate_all_findings(correlator, correlator.observed_store)
+
                                     # Check timeline consistency and apply penalties if it degrades
                                     old_consistency = timeline._last_score
                                     new_consistency = timeline.analyze_consistency()
@@ -2513,22 +3337,25 @@ async def run_agent(
                             # Model stopped without tool calls or verification result
                             break
 
-                    # If verification was not resolved, mark as inconclusive
+                    # If verification was not resolved, mark as inconclusive (unless already verified)
                     if not verification_resolved:
-                        old_conf = eo.confidence_score
-                        correlator.record_verification(
-                            eo.finding_id,
-                            "Verification exhausted without conclusive result",
-                            success=False,
-                        )
-                        correlator.finalize(eo.finding_id, "inconclusive")
-                        logger.log_verification_step(
-                            eo.finding_id, eo.hypothesis_id,
-                            "Verification iterations exhausted",
-                            "inconclusive", old_conf, eo.confidence_score,
-                        )
-                        print(f"  [Verification] {eo.hypothesis_id}: INCONCLUSIVE "
-                              f"(exhausted {max_verification_iterations} iterations)")
+                        if eo.status == "verified":
+                            print(f"  [Verification] Finding {eo.hypothesis_id} is already verified. Skipping inconclusive fallback.")
+                        else:
+                            old_conf = eo.confidence_score
+                            correlator.record_verification(
+                                eo.finding_id,
+                                "Verification exhausted without conclusive result",
+                                success=False,
+                            )
+                            correlator.finalize(eo.finding_id, "inconclusive")
+                            logger.log_verification_step(
+                                eo.finding_id, eo.hypothesis_id,
+                                "Verification iterations exhausted",
+                                "inconclusive", old_conf, eo.confidence_score,
+                            )
+                            print(f"  [Verification] {eo.hypothesis_id}: INCONCLUSIVE "
+                                  f"(exhausted {max_verification_iterations} iterations)")
 
             # ============================================================
             # PHASE 3: DFIR Validation -- Knowledge-Driven Rules
