@@ -4,14 +4,16 @@ An autonomous incident response and forensic triage agent built to investigate c
 
 ## What it does
 
-TriageForce acts as an autonomous virtual forensic analyst that conducts end-to-end investigations on mounted forensic disk images. It connects to a remote SANS SIFT workstation, gathers and correlates historical and execution artifacts, builds an interactive timeline of events, validates findings against DFIR best practices, maps compromised artifacts to MITRE ATT&CK techniques, and outputs a complete, audit-logged forensic report.
+TriageForce acts as an autonomous virtual forensic analyst that conducts end-to-end investigations on mounted forensic disk images. It connects to a remote SANS SIFT workstation, gathers and correlates historical and execution artifacts using **22 typed, read-only MCP tools**, builds an interactive timeline of events, validates findings against DFIR best practices, maps compromised artifacts to MITRE ATT&CK techniques, and outputs a complete, audit-logged forensic report.
 
-Through a structured, self-correcting analyst loop, the agent avoids early conclusions and hallucinatory claims by challenging its own findings. Specifically, it can:
+Through a structured, self-correcting analyst loop, the agent avoids early conclusions and hallucinatory claims by challenging its own findings. When a tool fails or returns empty results, built-in **Forensic Pivot Rules** automatically redirect the agent to alternative tools within the same artifact class. Specifically, it can:
 - **List and Hash Evidence**: Inspect case evidence directory file lists and calculate cryptographically secure hashes (SHA-256) of raw images.
 - **Parse Execution Artifacts**: Extract program execution history by parsing Windows Prefetch files, Amcache, UserAssist, RecentApps, and the Application Compatibility Cache (ShimCache).
 - **Inspect Event Logs**: Parse and query EVTX event logs (Security, System, Application) and operational logs (Sysmon, PowerShell script blocks) for suspicious executions, privilege assignments, and logon events.
+- **Deep Filesystem Analysis**: Parse the $MFT Master File Table, USN Change Journal, Windows shortcut (.lnk) files, and Recycle Bin metadata for file activity reconstruction.
+- **Registry Deep Dives**: Analyze SYSTEM, SAM, SOFTWARE, and SECURITY registry hives, extract service configurations, local user accounts, and aggregate all persistence/autorun locations.
+- **Network and User Activity**: Analyze PCAP network captures with tshark filters and parse Chrome/Firefox/IE browser history databases.
 - **Correlate and Verify Findings**: Automatically link disparate forensic logs (e.g. Sysmon execution events and ShimCache entries) to corroborate security claims and score confidence level.
-- **Expose Key Intrusion Actions**: Reconstruct adversarial timelines such as lateral movement, privilege escalation, credential dumping, and defense evasion.
 
 ## How we built it
 
@@ -22,7 +24,7 @@ TriageForce consists of two primary components communicating over a secure stdio
    - **`DFIRValidator`**: Enforces strict industry best practices. It enforces a **0.40 hard threshold**, meaning any finding with a confidence score under `0.40` is blocked from transition to `verified` status and remains `inconclusive`.
    - **`ForensicTimeline`**: Normalizes all extracted timestamps to UTC, sorts events chronologically, and checks for logical timeline anomalies (e.g., file execution before file creation).
    - **`MitreAttackMapper`**: Maps parsed forensic findings directly to the tactics and techniques of the MITRE ATT&CK framework.
-2. **Custom MCP Server (`server.py`)**: A Python-based Model Context Protocol server running on the remote SANS SIFT VM under root context. It exposes type-safe, read-only tools to the client. Rather than granting the agent a generic shell prompt (which introduces execution risk and commands that could modify evidence), it maps inputs to specific, read-only wrapper functions utilizing native SIFT forensic parsers like `PECmd`, `AmcacheParser`, `AppCompatCacheParser`, `RECmd`, `EvtxECmd`, `MFTECmd`, and `tshark`.
+2. **Custom MCP Server (`server.py`)**: A Python-based Model Context Protocol server running on the remote SANS SIFT VM under root context. It exposes **22 typed, read-only tools** to the client. Rather than granting the agent a generic shell prompt (which introduces execution risk and commands that could modify evidence), it maps inputs to specific, read-only wrapper functions utilizing native SIFT forensic parsers like `PECmd`, `AmcacheParser`, `AppCompatCacheParser`, `RECmd`, `EvtxECmd`, `MFTECmd`, `LECmd`, `RBCmd`, `tshark`, and Python's `sqlite3` and `xml.etree` modules.
 
 ### Target Case Validation
 To demonstrate the capabilities of TriageForce, we triaged a real-world compromised Windows XP disk image (`dmz-ftp-cdrive.E01`). The agent successfully reconstructed the attack chain with high confidence, identifying:
@@ -43,6 +45,8 @@ To demonstrate the capabilities of TriageForce, we triaged a real-world compromi
 - **Architectural Security is Key**: Relying on prompt engineering to keep an agent read-only is unsafe. By designing a custom MCP server that only exposes typed read-only wrappers, we created an unbreakable security boundary that prevents commands like `rm -rf` or file modification.
 - **Corroboration Prevents Hallucination**: LLMs can easily assume that a program ran based on a single registry key. Forcing the agent to search for secondary corroborating artifacts (e.g., pairing a ShimCache modified timestamp with an EVTX log entry) dramatically reduces false-positive claims and elevates overall accuracy.
 - **Time Normalization**: Merging timestamps from different event logs is challenging due to varying timezone configurations (UTC vs. local). Normalizing all timeline outputs to ISO 8601 UTC inside `ForensicTimeline` is essential to prevent chronological analysis failures.
+- **Forensic Pivot Logic**: When a primary forensic parser fails (e.g. Prefetch not found on Windows XP), the agent must not abandon the artifact class entirely. Building pivot rules that redirect to alternative tools (e.g. $MFT for Prefetch, ShimCache for Amcache) ensures comprehensive coverage regardless of OS version limitations.
+- **Environment Normalization**: Grounding the LLM on the canonical evidence root path at conversation start prevents path consistency warnings and tool invocation errors caused by the model guessing evidence mount locations.
 
 ## What's next
 

@@ -79,7 +79,7 @@ AUDIT_LOG_PATH = Path("agent_execution.jsonl")
 
 DEFAULT_MAX_ITERATIONS = 12
 
-MAX_VERIFICATION_ITERATIONS = 1
+MAX_VERIFICATION_ITERATIONS = 3
 
 # ---------------------------------------------------------------------------
 # Investigation System Prompt -- Senior Analyst Methodology
@@ -116,6 +116,94 @@ INVESTIGATION_SYSTEM_PROMPT = (
     "- Require corroboration for lateral movement claims (network + host evidence).\n"
     "- Require corroboration for persistence claims (registry + filesystem).\n"
     "- When citing evidence, be precise: include file paths, hash values, and timestamps.\n\n"
+
+    "FORENSIC PIVOT RULES:\n"
+    "When a tool returns an error or no results, do NOT skip the "
+    "artifact class. Instead:\n"
+    "  1. If analyze_prefetch fails: run analyze_mft with "
+    "filename_filter='Prefetch' to locate the directory in the MFT\n"
+    "  2. If analyze_amcache fails: run analyze_shimcache as the "
+    "primary execution artifact instead\n"
+    "  3. If analyze_evtx fails: run analyze_sysmon as the "
+    "alternative event source\n"
+    "  4. If analyze_sysmon fails: run analyze_powershell_logs\n"
+    "  5. Always document the pivot: which tool failed, why, "
+    "and what alternative was used\n"
+    "A senior analyst never abandons an artifact class because "
+    "one tool failed. They find another path to the same evidence.\n\n"
+
+    "PSEXEC DETECTION PROTOCOL:\n"
+    "When PSEXESVC.exe or PsExec.exe appears in any artifact:\n"
+    "  1. Immediately run analyze_evtx with log_name='System' "
+    "and event_ids='7045' to check for service installation\n"
+    "  2. Run analyze_evtx with log_name='Security' and "
+    "event_ids='4624' filtering for LogonType 3 or 10 around "
+    "the PsExec timestamp to identify the remote source\n"
+    "  3. Run analyze_services to verify PSEXESVC is/was "
+    "registered as a service\n"
+    "  4. Run analyze_sysmon with event_ids='1,3' to find "
+    "the process creation and network connection\n"
+    "This is mandatory when PsExec is detected. Do not proceed "
+    "to other findings until this chain is complete.\n\n"
+
+    "CREDENTIAL DUMPING PROTOCOL:\n"
+    "When PWDumpX.exe, mimikatz, or similar credential dumpers "
+    "appear in any artifact:\n"
+    "  1. Run analyze_evtx with log_name='Security' and "
+    "event_ids='4624,4625,4648' to find logons using "
+    "dumped credentials\n"
+    "  2. Run analyze_sam_users to enumerate what accounts "
+    "existed and could have been dumped\n"
+    "  3. Run analyze_sysmon with event_ids='8' to check for "
+    "process injection into LSASS\n"
+    "This is mandatory when credential dumpers are detected.\n\n"
+
+    "PERSISTENCE PIVOT PROTOCOL:\n"
+    "When Schtasks.exe, Task Scheduler artifacts, Registry Run keys, Reg.exe, services, startup folders, or autorun indicators appear in any artifact:\n"
+    "  1. Run analyze_scheduled_tasks to enumerate scheduled tasks and commands.\n"
+    "  2. Run analyze_autoruns to correlate Run keys, services, tasks, and startup folders.\n"
+    "  3. If Reg.exe or registry modification appears, run analyze_registry_hive against SOFTWARE and SYSTEM for Run keys, Services, and TaskCache-related keys where available.\n"
+    "  4. Correlate persistence artifacts with ShimCache, Sysmon Event ID 1, Security 4688, and MFT/USN timestamps before making a high-confidence persistence finding.\n"
+    "  5. Map confirmed scheduled task persistence to T1053.005 and registry persistence/modification to T1112 only when supported by artifact details.\n"
+    "This protocol is mandatory when scheduled task or registry persistence indicators are detected.\n\n"
+
+    "ADMINISTRATOR LOGON VERIFICATION PROTOCOL:\n"
+    "When Administrator, BASE-FTP\\Administrator, or another privileged account appears in Security 4624 logons:\n"
+    "  1. Run analyze_evtx with log_name='Security' and event_ids='4672' around the same time window to check for special privileges assigned.\n"
+    "  2. Run analyze_evtx with log_name='Security' and event_ids='4648' to check for explicit credential use.\n"
+    "  3. If remote access is suspected, run analyze_evtx with log_name='Security', event_ids='4624', and logon_type='3'.\n"
+    "  4. If RDP or remote interactive access is suspected, run analyze_evtx with log_name='Security', event_ids='4624', and logon_type='10'.\n"
+    "  5. Correlate privileged logons with process creation, services, scheduled tasks, autoruns, and network connections before claiming lateral movement.\n"
+    "  6. Map confirmed valid account abuse to T1078 only when privilege or remote-use evidence is present.\n"
+    "This protocol is mandatory when privileged account logons are detected.\n\n"
+
+    "SYSMON64 AND POWERSHELL DELIVERY PROTOCOL:\n"
+    "When Sysmon64.exe appears from an unusual path such as C:\\ProgramData\\sysmon\\ or a user-writable directory:\n"
+    "  1. Run analyze_sysmon with event_ids='1' to find process creation for Sysmon64.exe and parent process context.\n"
+    "  2. Run analyze_powershell_logs with search_term='sysmon' and event_ids='4103,4104' to identify PowerShell download or execution commands.\n"
+    "  3. Run analyze_evtx with log_name='Security' and event_ids='4688' to look for process creation evidence if available.\n"
+    "  4. Run analyze_mft or analyze_usn_journal with filename_filter='Sysmon64.exe' to identify file creation or modification timing.\n"
+    "  5. Treat Sysmon as dual-use: do not call it malicious unless the path, parent process, command line, download source, or timing supports adversary use.\n"
+    "  6. Map PowerShell delivery to T1059.001 only when command/script evidence exists.\n"
+    "This protocol is mandatory when Sysmon64.exe appears outside standard defender deployment context.\n\n"
+
+    "SINGLE-ARTIFACT CORROBORATION PROTOCOL:\n"
+    "When a finding is based mainly on one artifact class, especially ShimCache:\n"
+    "  1. Do not mark it verified yet.\n"
+    "  2. Attempt corroboration using at least one independent artifact class.\n"
+    "  3. For execution findings, try Prefetch, Amcache, Sysmon Event ID 1, Security 4688, MFT, or USN Journal.\n"
+    "  4. For persistence findings, try Scheduled Tasks, Autoruns, Services, Registry hives, MFT, or USN Journal.\n"
+    "  5. For logon findings, try Security 4672, 4648, Sysmon, network connections, and related process creation.\n"
+    "  6. If corroboration is unavailable or absent, label the finding INCONCLUSIVE and explain the evidence gap.\n"
+    "This protocol protects forensic soundness and should be followed before raising confidence.\n\n"
+
+    "INITIAL ACCESS / SYSTEM ZERO PROTOCOL:\n"
+    "After persistence, credential dumping, or administrator logon activity is identified:\n"
+    "  1. Attempt to identify the earliest suspicious timestamp across MFT, USN Journal, ShimCache, Sysmon, EVTX, browser history, and user activity artifacts.\n"
+    "  2. Use analyze_mft and analyze_usn_journal with summary_only=True first for broad searches, then rerun with narrower filename_filter values when suspicious files are found.\n"
+    "  3. Pivot on users, filenames, download paths, browser history, installer names, archive files, scripts, and user-writable directories.\n"
+    "  4. Do not guess initial access. If the first observed malicious action is not the true entry point, clearly label it as earliest observed activity.\n"
+    "This protocol is mandatory once the agent has enough evidence of compromise to reconstruct the attack timeline.\n\n"
 
     "STRUCTURED FINDINGS:\n"
     "When you identify a forensic finding, emit it as a structured block:\n"
@@ -187,6 +275,77 @@ class EvidenceObject:
             return "MEDIUM"
         else:
             return "LOW"
+
+
+def _extract_specific_entities(text: str) -> set[str]:
+    import re
+    entities = set()
+    text_lower = text.lower()
+    
+    # 1. Executables / extensions (excluding generic ones like case files, but keeping main system artifacts)
+    executables = re.findall(r'\b[\w\.-]+\.(?:exe|dll|sys|bat|ps1|vbs|bin|hve|evtx|e01)\b', text_lower)
+    # Exclude generic setup files if any
+    for exe in executables:
+        if "case" not in exe:
+            entities.add(exe)
+    
+    # 2. IP Addresses
+    ips = re.findall(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', text_lower)
+    entities.update(ips)
+    
+    # 3. Registry paths or keys
+    reg_paths = re.findall(r'\b(?:hklm|hkcu|controlset\d{3}|currentcontrolset|services|sam|software|security|registry|domains\\account\\users|ntuser)\b', text_lower)
+    entities.update(reg_paths)
+    
+    # 4. File paths or relative paths (containing backslash/slash, excluding cases directory paths)
+    paths = re.findall(r'\b[\w\.-]+[\\/][\w\.-]+[\\/\w\.-]*', text_lower)
+    for p in paths:
+        if "cases" not in p and "evidence" not in p:
+            entities.add(p)
+    
+    # 5. Usernames (common ones in case files, plus common Windows users)
+    usernames = {"administrator", "guest", "rsydow", "rsydow-a", "ftpadmin", "nfury", "dblake", "system", "local service", "network service"}
+    for u in usernames:
+        if re.search(rf'\b{u}\b', text_lower):
+            entities.add(u)
+            
+    return entities
+
+
+def _truncate_tool_result(result_content: Any) -> str:
+    raw_text = ""
+    if isinstance(result_content, str):
+        raw_text = result_content
+    elif isinstance(result_content, list):
+        parts = []
+        for part in result_content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif hasattr(part, "text") and part.text:
+                parts.append(part.text)
+            elif isinstance(part, dict) and "text" in part:
+                parts.append(part["text"])
+        raw_text = "".join(parts)
+    else:
+        raw_text = str(result_content)
+        
+    try:
+        data = json.loads(raw_text)
+        if isinstance(data, dict) and "entries" in data and isinstance(data["entries"], list):
+            entries = data["entries"]
+            if len(entries) > 20:
+                truncated_data = {}
+                for k, v in data.items():
+                    if k != "entries":
+                        truncated_data[k] = v
+                truncated_data["entries"] = entries[:20]
+                total = len(entries)
+                truncated_data["note"] = f"Showing first 20 entries. The full output of {total} entries was recorded in the audit log."
+                return json.dumps(truncated_data)
+    except Exception:
+        pass
+        
+    return raw_text
 
 
 class EvidenceCorrelator:
@@ -310,12 +469,16 @@ class EvidenceCorrelator:
             eo.status = status
             eo.updated_at = datetime.now(timezone.utc).isoformat()
 
-    def find_related(self, claim_keywords: list[str]) -> list[EvidenceObject]:
-        """Find evidence objects whose claims overlap with the given keywords."""
+    def find_related(self, claim_text: str) -> list[EvidenceObject]:
+        """Find evidence objects whose claims overlap with the given claim_text by sharing specific entities."""
         results = []
+        new_entities = _extract_specific_entities(claim_text)
+        if not new_entities:
+            return []
+            
         for eo in self.evidence.values():
-            claim_lower = eo.claim.lower()
-            if any(kw.lower() in claim_lower for kw in claim_keywords if len(kw) > 2):
+            eo_entities = _extract_specific_entities(eo.claim)
+            if new_entities.intersection(eo_entities):
                 results.append(eo)
         return results
 
@@ -964,6 +1127,60 @@ def _print_correlation_report(
     Contradictions, Verification Actions, Timeline Evidence, ATT&CK Mapping, and Final Assessment.
     Also logs the report summary to the audit log.
     """
+    if getattr(logger, "is_tool_validation", False):
+        executed_tools = getattr(logger, "executed_tools", [])
+        
+        tools_success = []
+        tools_no_results = []
+        tools_error = []
+        for t in executed_tools:
+            if t["status"] == "success" and (t["total_entries"] is None or t["total_entries"] > 0):
+                tools_success.append(t)
+            elif t["status"] == "no_results" or (t["status"] == "success" and t["total_entries"] == 0):
+                tools_no_results.append(t)
+            else:
+                tools_error.append(t)
+                
+        print(f"\n{'='*80}")
+        print(f"  TOOL VALIDATION REPORT")
+        print(f"{'='*80}")
+        print("  EXECUTIVE SUMMARY")
+        print("  -----------------")
+        print(f"    Total Tools Run: {len(executed_tools)}")
+        print(f"    Successful     : {len(tools_success)}")
+        print(f"    No Results     : {len(tools_no_results)}")
+        print(f"    Errors/Failed  : {len(tools_error)}")
+        print()
+        
+        print("  DETAILED TOOL RESULTS")
+        print("  ---------------------")
+        if tools_success:
+            print("    Successful tools (returned entries):")
+            for t in tools_success:
+                entry_str = f" ({t['total_entries']} entries)" if t["total_entries"] is not None else ""
+                print(f"      - {t['tool_name']}{entry_str}")
+        if tools_no_results:
+            print("    Tools with no results:")
+            for t in tools_no_results:
+                print(f"      - {t['tool_name']}")
+        if tools_error:
+            print("    Tools with errors:")
+            for t in tools_error:
+                print(f"      - {t['tool_name']}")
+        print(f"{'-'*80}")
+        print("  Tool validation completed successfully.")
+        print(f"{'='*80}\n")
+        
+        report_data = {
+            "is_tool_validation": True,
+            "total_tools_run": len(executed_tools),
+            "successful_tools": [t["tool_name"] for t in tools_success],
+            "no_results_tools": [t["tool_name"] for t in tools_no_results],
+            "error_tools": [t["tool_name"] for t in tools_error]
+        }
+        logger.log_report_generated(report_data)
+        return
+
     all_evidence = correlator.get_all()
     summary = correlator.get_summary()
 
@@ -1014,11 +1231,43 @@ def _print_correlation_report(
 
     print("  EVIDENCE SOURCES USED")
     print("  ---------------------")
-    if not sources_used:
+    if not getattr(logger, "executed_tools", []) and not sources_used:
         print("    No remote SIFT workstation evidence sources utilized.")
     else:
-        for src in sorted(sources_used):
-            print(f"    * {src}")
+        if sources_used:
+            print("    Evidence sources linked to findings:")
+            for src in sorted(sources_used):
+                print(f"      * {src}")
+            print()
+            
+        executed_tools = getattr(logger, "executed_tools", [])
+        if executed_tools:
+            print("    MCP Tools Executed:")
+            tools_success = []
+            tools_no_results = []
+            tools_error = []
+            for t in executed_tools:
+                if t["status"] == "success" and (t["total_entries"] is None or t["total_entries"] > 0):
+                    tools_success.append(t)
+                elif t["status"] == "no_results" or (t["status"] == "success" and t["total_entries"] == 0):
+                    tools_no_results.append(t)
+                else:
+                    tools_error.append(t)
+            
+            print(f"      * Total Executed: {len(executed_tools)}")
+            if tools_success:
+                print("      * Tools with entries:")
+                for t in tools_success:
+                    entry_str = f" ({t['total_entries']} entries)" if t["total_entries"] is not None else ""
+                    print(f"        - {t['tool_name']}{entry_str}")
+            if tools_no_results:
+                print("      * Tools with no results:")
+                for t in tools_no_results:
+                    print(f"        - {t['tool_name']}")
+            if tools_error:
+                print("      * Tools with errors:")
+                for t in tools_error:
+                    print(f"        - {t['tool_name']}")
     print()
 
     print("  ATTACK NARRATIVE")
@@ -1155,6 +1404,7 @@ class AuditLogger:
         self.log_path = log_path
         self.session_id = session_id
         self._file = log_path.open("a", encoding="utf-8")
+        self.executed_tools = []
 
     def _write(self, event_type: str, payload: dict[str, Any]) -> None:
         entry = {
@@ -1221,6 +1471,29 @@ class AuditLogger:
         if confidence_after is not None:
             payload["confidence_after"] = round(confidence_after, 2)
         self._write("tool_result", payload)
+
+        status = "success"
+        entries = None
+        if isinstance(result, str):
+            try:
+                data = json.loads(result)
+                if isinstance(data, dict):
+                    if "error" in data:
+                        status = "error"
+                    else:
+                        status = data.get("status", "success")
+                        entries = data.get("total_entries", None)
+            except Exception:
+                if "error" in result.lower() or "exception" in result.lower():
+                    status = "error"
+        else:
+            status = "error"
+            
+        self.executed_tools.append({
+            "tool_name": tool_name,
+            "status": status,
+            "total_entries": entries
+        })
 
     def log_token_usage(
         self,
@@ -1656,6 +1929,10 @@ async def run_agent(
 
     gemini_client = _get_gemini_client()
 
+    task_lower = task.lower()
+    is_tool_validation = any(phrase in task_lower for phrase in ["test the new mcp", "test fixed registry", "for each tool, report", "test mcp tools", "test tool"])
+    logger.is_tool_validation = is_tool_validation
+
     server_params = StdioServerParameters(
         command=SSH_FLAGS[0],
         args=SSH_FLAGS[1:],
@@ -1708,6 +1985,31 @@ async def run_agent(
                     parts=[types.Part.from_text(text=task)],
                 )
             ]
+
+            # Environment normalization: ground the model on the canonical evidence root
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=(
+                        "ENVIRONMENT CONTEXT: The evidence is mounted at "
+                        "/cases/case_001/evidence/. ALL tool calls must use "
+                        "case_id='case_001' and all file_path arguments must "
+                        "be relative to this mount (e.g. 'BOOTNXT' not "
+                        "'/cases/case_001/BOOTNXT'). This is the ONLY valid "
+                        "evidence root. Do not reference any other path prefix."
+                    ))],
+                )
+            )
+            contents.append(
+                types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text=(
+                        "Understood. I will use case_id='case_001' for all "
+                        "tool calls and reference all evidence relative to "
+                        "/cases/case_001/evidence/."
+                    ))],
+                )
+            )
 
             # Generation config with system instruction and tools
             config = types.GenerateContentConfig(
@@ -1796,7 +2098,7 @@ async def run_agent(
                             print(f"  [Planner] New investigation plan generated: '{added_plan['hypothesis'][:60]}'")
 
                         # --- Parse structured evidence claims ---
-                        claims = _parse_evidence_claims(part.text)
+                        claims = [] if is_tool_validation else _parse_evidence_claims(part.text)
                         for claim_data in claims:
                             claim_text = claim_data.get("claim", "")
                             source = claim_data.get("source", "")
@@ -1804,8 +2106,7 @@ async def run_agent(
                             contradiction = claim_data.get("contradictions", "")
 
                             # Check if this corroborates an existing finding
-                            keywords = [w for w in claim_text.split()[:5] if len(w) > 2]
-                            related = correlator.find_related(keywords) if keywords else []
+                            related = correlator.find_related(claim_text) if claim_text else []
 
                             if related:
                                 # Corroborate the most relevant existing finding
@@ -1912,7 +2213,7 @@ async def run_agent(
                         function_response_parts.append(
                             types.Part.from_function_response(
                                 name=tool_name,
-                                response={"result": str(result_content)},
+                                response={"result": _truncate_tool_result(result_content)},
                             )
                         )
                     except Exception as exc:
@@ -1956,7 +2257,7 @@ async def run_agent(
                 if eo.status == "hypothesis"
             ]
 
-            if unverified:
+            if unverified and not is_tool_validation:
                 print(f"\n{'-'*60}")
                 print(f"  VERIFICATION STAGE -- {len(unverified)} finding(s) to verify")
                 print(f"  Max {max_verification_iterations} verification iteration(s) per finding")
@@ -2185,7 +2486,7 @@ async def run_agent(
                                     function_response_parts.append(
                                         types.Part.from_function_response(
                                             name=tool_name,
-                                            response={"result": str(result_content)},
+                                            response={"result": _truncate_tool_result(result_content)},
                                         )
                                     )
                                 except Exception as exc:

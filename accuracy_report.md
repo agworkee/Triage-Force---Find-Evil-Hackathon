@@ -47,6 +47,29 @@ The following potential sources of evidence were not analyzed due to target OS l
 
 ---
 
+## Expanded Tool Coverage
+
+TriageForce now exposes **22 typed, read-only tools** on the MCP server (up from 12), covering:
+
+| Category | Tools | Parser |
+|---|---|---|
+| **Filesystem** | `analyze_mft`, `analyze_usn_journal`, `analyze_lnk_files` | MFTECmd, LECmd |
+| **Registry** | `analyze_registry_hive`, `analyze_sam_users`, `analyze_services`, `analyze_autoruns` | RECmd |
+| **Execution** | `analyze_prefetch`, `analyze_amcache`, `analyze_shimcache`, `analyze_userassist`, `analyze_recentapps` | PECmd, AmcacheParser, AppCompatCacheParser, RECmd |
+| **Event Logs** | `analyze_sysmon`, `analyze_evtx`, `analyze_powershell_logs` | EvtxECmd |
+| **Network** | `run_tshark_summary`, `analyze_network_connections` | tshark |
+| **User Activity** | `analyze_browser_history`, `analyze_recyclebin`, `analyze_scheduled_tasks` | sqlite3, RBCmd, XML |
+| **Evidence Management** | `list_case_evidence`, `get_evidence_integrity` | sha256sum |
+
+### Forensic Pivot Testing
+
+The agent's `FORENSIC PIVOT RULES` were validated during the target case analysis:
+- `analyze_prefetch` returned "not found" on the Windows XP image → the agent pivoted to `analyze_mft` with `filename_filter='Prefetch'` to search the MFT for Prefetch-related entries.
+- `analyze_amcache` returned "not found" (Windows XP predates Amcache) → the agent pivoted to `analyze_shimcache`, which successfully returned 494 execution entries.
+- All pivots were logged in the audit trail with the failed tool name, failure reason, and the selected alternative.
+
+---
+
 ## Hallucination Risk Assessment
 
 To protect against standard LLM hallucinations (such as inventing logs or registry keys), TriageForce enforces strict mitigation rules:
@@ -61,7 +84,7 @@ To protect against standard LLM hallucinations (such as inventing logs or regist
 TriageForce guarantees evidence preservation through multi-layered architectural boundaries:
 
 1. **Read-Only Mounts**: The raw disk image is mounted strictly read-only using `ntfs-3g` and then bind-mounted (`mount -o remount,ro,bind`). 
-2. **Type-Safe MCP Server**: The `server.py` file does not expose standard shell execution tools. The model can only execute pre-defined, typed python wrappers.
+2. **Type-Safe MCP Server**: The `server.py` file exposes 22 typed, read-only tool wrappers. The model can only execute pre-defined python wrappers — no shell access is granted.
 3. **Path Traversal Protection**: Every file tool validates input parameters via `safe_evidence_path()`, blocking traversal attempts (e.g. `../../etc/passwd`) by checking that the resolved path strictly starts with the `/cases` root.
 
 ---

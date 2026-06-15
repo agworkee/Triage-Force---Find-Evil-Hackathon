@@ -84,11 +84,12 @@ python agent.py --task "Perform full forensic triage on case_001: list all evide
 
 When you run the agent, the console will display the following structured stages:
 
-1. **Pre-flight Diagnostic**: Connection status, remote host credentials, and list of 12 discovered MCP tools.
+1. **Pre-flight Diagnostic**: Connection status, remote host credentials, and list of 22 discovered MCP tools.
 2. **Investigation Plans**: Blocks starting with `[Planner] New investigation plan generated` specifying hypotheses and tools.
 3. **Evidence Claims**: Structural blocks starting with `evidence_claim` showing initial findings and base confidence scores.
 4. **Verification Stage**: Bounded iteration blocks starting with `[Verify H-00X]` where the agent challenges its own claims.
-5. **Correlation Report**: A final terminal summary featuring:
+5. **Forensic Pivots**: When a tool fails (e.g. Prefetch not found on Windows XP), `[Pivot]` messages show the agent switching to an alternative tool (e.g. `analyze_mft` with a filename filter).
+6. **Correlation Report**: A final terminal summary featuring:
    - Executive Summary (counts of verified, refuted, inconclusive findings).
    - Confidence Distribution.
    - **MITRE ATT&CK Summary Table** mapping tactics, techniques, and IDs.

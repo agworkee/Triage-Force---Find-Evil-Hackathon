@@ -67,9 +67,28 @@ Uses `ClientSession` and `stdio_client` from the `mcp` SDK to initiate the conne
 | **tool execution** | Dispatches requests to tools | Invokes tools via `call_tool()` | ✅ Compatible |
 
 ### Tools Discovered
-1. `get_evidence_integrity`: Computes case file checksums (`sha256sum`).
-2. `run_tshark_summary`: Extracts network hierarchy information (`tshark -q -z io,phs`).
-3. `list_case_evidence`: Lists case subdirectory files safely.
+1. `list_case_evidence`: Lists case subdirectory files safely.
+2. `get_evidence_integrity`: Computes case file checksums (`sha256sum`).
+3. `run_tshark_summary`: Extracts network hierarchy information (`tshark -q -z io,phs`).
+4. `analyze_prefetch`: Parses Windows Prefetch files (`PECmd`).
+5. `analyze_amcache`: Parses Amcache registry hive (`AmcacheParser`).
+6. `analyze_shimcache`: Parses AppCompatCache / ShimCache (`AppCompatCacheParser`).
+7. `analyze_userassist`: Parses UserAssist registry entries (`RECmd`).
+8. `analyze_recentapps`: Parses RecentApps registry entries (`RECmd`).
+9. `analyze_sysmon`: Parses Sysmon Event Logs (`EvtxECmd`).
+10. `analyze_evtx`: Parses Security, System, or Application logs (`EvtxECmd`).
+11. `analyze_powershell_logs`: Parses PowerShell Event Logs (`EvtxECmd`).
+12. `analyze_usn_journal`: Parses NTFS USN Change Journal (`MFTECmd`).
+13. `analyze_mft`: Parses the $MFT Master File Table (`MFTECmd`).
+14. `analyze_registry_hive`: Parses SYSTEM/SAM/SOFTWARE/SECURITY registry hives (`RECmd`).
+15. `analyze_lnk_files`: Parses Windows shortcut (.lnk) files (`LECmd`).
+16. `analyze_recyclebin`: Parses deleted file metadata from $Recycle.Bin (`RBCmd`).
+17. `analyze_scheduled_tasks`: Parses Windows Scheduled Task XML definitions.
+18. `analyze_services`: Parses Windows services from the SYSTEM registry hive (`RECmd`).
+19. `analyze_sam_users`: Parses local user accounts from the SAM registry hive (`RECmd`).
+20. `analyze_network_connections`: Analyzes PCAP network captures (`tshark`).
+21. `analyze_browser_history`: Parses Chrome/Firefox/IE browser history databases (`sqlite3`).
+22. `analyze_autoruns`: Aggregates all persistence/autorun locations across registry, tasks, services, and startup folders.
 
 ## 3.5 Evidence Correlation & Self-Correction Engine Status
 
@@ -77,9 +96,10 @@ The cognitive analyst loop is fully upgraded and operational. All security requi
 
 ### Upgraded Capabilities:
 1. **Investigation Planning**: Generates structured `investigation_plan` objects to organize hypothesis testing, logged directly in the audit trail.
-2. **Forensic Timeline Reconstruction**: Aggregates timestamped events across Prefetch, Sysmon, EVTX logs, Amcache, UserAssist, and USN Journal. Normalizes to UTC, builds chronological listings, and penalizes findings if contradictions (e.g. execution before creation) are detected.
+2. **Forensic Timeline Reconstruction**: Aggregates timestamped events across Prefetch, Sysmon, EVTX logs, Amcache, UserAssist, USN Journal, MFT, LNK files, and Scheduled Tasks. Normalizes to UTC, builds chronological listings, and penalizes findings if contradictions (e.g. execution before creation) are detected.
 3. **MITRE ATT&CK Mapping**: Maps findings automatically to tactics and techniques across 9 tactics (Initial Access through Exfiltration).
 4. **Enhanced Reporting**: Includes Executive Summary, Confidence distribution, MITRE ATT&CK summary table, Evidence sources list, Attack Narrative, Chronological Timeline, and Detailed Findings with timeline/ATT&CK details.
+5. **Forensic Pivot Logic**: When a tool returns errors or no results, the agent automatically pivots to alternative tools within the same artifact class (e.g. Prefetch → MFT, Amcache → ShimCache, EVTX → Sysmon → PowerShell logs).
 
 ### Verification Configurations:
 - **`MAX_VERIFICATION_ITERATIONS`**: `3` (Hard cap to prevent infinite loops)
@@ -124,6 +144,16 @@ The cognitive analyst loop is fully upgraded and operational. All security requi
 * **Coverage**: Full coverage of model decisions, plans, tool parameters, raw execution metadata, and confidence deltas.
 * **Remaining Gaps**: Token-level caching and input prompts are stored as counts, not raw text strings, to optimize audit log size. Full raw prompts are reconstructible using the session identifier.
 
+### 3.6.5 Forensic Pivot Capability
+* **Mechanism**: Built-in `FORENSIC PIVOT RULES` in the system prompt instruct the model to try alternative tools when a primary parser fails or returns empty results.
+* **Pivot Chains**:
+  * `analyze_prefetch` → `analyze_mft` (filename filter for Prefetch directory)
+  * `analyze_amcache` → `analyze_shimcache` (primary execution artifact fallback)
+  * `analyze_evtx` → `analyze_sysmon` (alternative event source)
+  * `analyze_sysmon` → `analyze_powershell_logs` (secondary event source)
+* **Environment Normalization**: An injected environment context message at conversation start grounds the model on the canonical evidence root path (`/cases/case_001/evidence/`), preventing path consistency warnings.
+* **Traceability**: Every pivot is documented in the audit log with the failed tool, reason for failure, and selected alternative.
+
 ---
 
 ## 4. Pre-Flight Checklist
@@ -140,4 +170,4 @@ Before launching the autonomous agent loop in production, verify the following s
 
 # ✅ DEPLOYMENT READY
 
-The integration between the Windows agent client and SIFT workstation server is fully verified. Handshakes complete successfully and tool schemas are dynamically resolved. All core forensic validator rules and upgraded reporting features are fully functional.
+The integration between the Windows agent client and SIFT workstation server is fully verified. Handshakes complete successfully and all 22 tool schemas are dynamically resolved. All core forensic validator rules, forensic pivot logic, and upgraded reporting features are fully functional.

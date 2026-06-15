@@ -26,6 +26,12 @@ Due to the operating system version of the target (Windows XP), certain modern W
 | **Amcache** | `Windows/appcompat/Programs/Amcache.hve` | ❌ MISSING | **Not Present**: Windows XP predates the introduction of the Amcache registry structure (introduced in Windows 8). |
 | **Sysmon EVTX** | `Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx` | ✅ PRESENT | **13 Process Creation events** (Event ID 1) parsed. Contained computer name `dmz-ftp`, PID, parent processes, and MD5 hashes. |
 | **Security EVTX** | `Windows/System32/winevt/Logs/Security.evtx` | ✅ PRESENT | **102 entries** parsed. Targeted logon events (Event ID 4624) and process creations (Event ID 4688). |
+| **$MFT** | `$MFT` | ✅ PRESENT | Master File Table parsed via `MFTECmd`. Contains full filesystem metadata including timestamps, entry numbers, and file sizes. |
+| **SYSTEM Hive** | `Windows/System32/config/SYSTEM` | ✅ PRESENT | Registry hive parsed via `RECmd`. Services and ControlSet configurations extracted. |
+| **SAM Hive** | `Windows/System32/config/SAM` | ✅ PRESENT | Local user accounts and RIDs extracted via `RECmd`. |
+| **SOFTWARE Hive** | `Windows/System32/config/SOFTWARE` | ✅ PRESENT | Registry Run keys and installed software entries parsed via `RECmd`. |
+| **Scheduled Tasks** | `Windows/System32/Tasks` | ⚠️ PARTIAL | Task XML definitions parsed where present. Windows XP used `.job` format which is not covered by the XML parser. |
+| **$Recycle.Bin** | `$Recycle.Bin` | ⚠️ PARTIAL | Recycle Bin metadata parsed via `RBCmd`. Windows XP may use `RECYCLER` instead of `$Recycle.Bin`. |
 
 ---
 
@@ -90,4 +96,5 @@ sudo touch /cases/case_001/evidence/test.txt
 
 - **Timezone Inconsistencies**: Windows XP ShimCache modified times do not always translate directly to UTC, depending on whether the system had active timezone offsets applied in control set configurations.
 - **PowerShell Script Block Limitations**: On older OS levels, PowerShell script block logging (Event ID 4104) is restricted or not natively captured compared to Windows 10/Server 2016, limiting query results.
-- **Registry Hives**: The agent is restricted to standard `RECmd` batch templates. Direct, custom registry queries outside the templates are blocked to prevent command injection, limiting deep registry carving.
+- **Registry Hives**: The agent supports parsing of SYSTEM, SAM, SOFTWARE, and SECURITY hives via `RECmd`, plus per-user NTUSER.DAT hives. Custom registry queries outside the supported key paths are blocked to prevent command injection.
+- **Forensic Pivot Coverage**: The agent's pivot rules cover the 4 most common artifact class failures (Prefetch, Amcache, EVTX, Sysmon). Additional pivots for less common failures (e.g. LNK → MFT, RecycleBin → USN Journal) may be added in future iterations.

@@ -38,7 +38,7 @@ TriageForce enforces security at the architectural level rather than relying sol
 ```
 
 ### Key Security & Integrity Boundaries:
-*   **No Generic Shell Access:** Unlike bridged SSH MCP servers that expose shell access, `server.py` exposes *only* typed, read-only tools:
+*   **No Generic Shell Access:** Unlike bridged SSH MCP servers that expose shell access, `server.py` exposes *only* typed, read-only tools (22 total):
     *   `list_case_evidence`: Lists evidence files available in a case directory.
     *   `get_evidence_integrity`: Computes case file hashes (`sha256sum`).
     *   `run_tshark_summary`: Extracts network hierarchy information (`tshark`).
@@ -51,6 +51,16 @@ TriageForce enforces security at the architectural level rather than relying sol
     *   `analyze_evtx`: Parses Security, System, or Application logs (`EvtxECmd`).
     *   `analyze_powershell_logs`: Parses PowerShell Event Logs (`EvtxECmd`).
     *   `analyze_usn_journal`: Parses NTFS USN Change Journal (`MFTECmd`).
+    *   `analyze_mft`: Parses the $MFT Master File Table (`MFTECmd`).
+    *   `analyze_registry_hive`: Parses SYSTEM/SAM/SOFTWARE/SECURITY registry hives (`RECmd`).
+    *   `analyze_lnk_files`: Parses Windows shortcut (.lnk) files (`LECmd`).
+    *   `analyze_recyclebin`: Parses deleted file metadata from $Recycle.Bin (`RBCmd`).
+    *   `analyze_scheduled_tasks`: Parses Windows Scheduled Task XML definitions.
+    *   `analyze_services`: Parses Windows services from the SYSTEM registry hive (`RECmd`).
+    *   `analyze_sam_users`: Parses local user accounts from the SAM registry hive (`RECmd`).
+    *   `analyze_network_connections`: Analyzes PCAP network captures (`tshark`).
+    *   `analyze_browser_history`: Parses Chrome/Firefox/IE browser history databases (`sqlite3`).
+    *   `analyze_autoruns`: Aggregates all persistence/autorun locations across registry, tasks, services, and startup folders.
     The agent has no mechanism to write files or run arbitrary commands.
 *   **Read-Only OS Mounts:** Original E01 disk images are mounted using `ewfmount` to stage a raw volume, which is then bind-mounted read-only at `/cases/case_001/evidence/` via `mount -o remount,ro,bind`.
 *   **Logical Consistency Checks:** Every iteration runs check rules inside `agent.py` to identify contradictions (e.g. conflicting hash results, timestamp timezone anomalies, or attempted write actions) and flags them immediately.
@@ -113,10 +123,19 @@ Post-verification, the `DFIRValidator` runs industry-standard rules to identify 
 ### 4.1 Investigation Planning
 Before executing tools to investigate a new hypothesis or branch, the agent generates a structured `investigation_plan` representing the hypothesis, required artifacts, tool selection rationale, and expected evidence. This is logged to the audit trail as an `investigation_plan` event.
 
-### 4.2 Forensic Timeline Reconstruction
-The `ForensicTimeline` collects timestamped events from tool outputs (Prefetch, Sysmon, EVTX, Amcache, UserAssist, USN Journal) and normalizes them to UTC. It analyzes them for chronological contradictions (e.g., execution before creation). Any contradiction triggers a penalty to the confidence score of related findings.
+### 4.2 Forensic Pivot Logic
+When a tool returns an error or empty results (e.g. Prefetch directory not found on a Windows XP image), the agent does not abandon the artifact class. Instead, it follows built-in **Forensic Pivot Rules** that redirect it to alternative tools:
+- If `analyze_prefetch` fails → pivot to `analyze_mft` with a filename filter for Prefetch artifacts.
+- If `analyze_amcache` fails → pivot to `analyze_shimcache` as the primary execution artifact.
+- If `analyze_evtx` fails → pivot to `analyze_sysmon` as the alternative event source.
+- If `analyze_sysmon` fails → pivot to `analyze_powershell_logs`.
 
-### 4.3 MITRE ATT&CK Mapping
+Every pivot is documented in the audit log, ensuring full traceability of which tools were tried and why alternatives were selected.
+
+### 4.3 Forensic Timeline Reconstruction
+The `ForensicTimeline` collects timestamped events from tool outputs (Prefetch, Sysmon, EVTX, Amcache, UserAssist, USN Journal, MFT, LNK files, Scheduled Tasks) and normalizes them to UTC. It analyzes them for chronological contradictions (e.g., execution before creation). Any contradiction triggers a penalty to the confidence score of related findings.
+
+### 4.4 MITRE ATT&CK Mapping
 The `MitreAttackMapper` automatically maps forensic findings to tactics and techniques of the MITRE ATT&CK framework across all 9 requested tactics: Initial Access, Execution, Persistence, Privilege Escalation, Defense Evasion, Discovery, Lateral Movement, Collection, and Exfiltration. Mappings are stored on the `EvidenceObject` and visualized in the final report.
 
 ### 5. Full Execution Traceability
