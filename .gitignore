@@ -27,3 +27,6 @@ Thumbs.db
 
 # Runtime logs
 agent_execution.jsonl
+
+scratch/
+*.log

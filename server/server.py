@@ -219,29 +219,80 @@ def analyze_prefetch(case_id: str, executable_filter: str = "") -> str:
     if prefetch_dir is None:
         return json.dumps({"error": "Path traversal detected"})
 
-    if not os.path.isdir(prefetch_dir):
-        # Fallback: search for Prefetch directory anywhere in evidence
-        prefetch_candidates = glob.glob(
-            os.path.join(evidence_dir, "**", "Prefetch"),
-            recursive=True
-        )
-        if prefetch_candidates:
-            prefetch_dir = prefetch_candidates[0]
+    found_prefetch = False
+    if os.path.isdir(prefetch_dir):
+        found_prefetch = True
+    else:
+        # Check other known likely locations
+        likely_relative_paths = [
+            "WINDOWS/Prefetch",
+            "windows/Prefetch",
+            "Windows/prefetch"
+        ]
+        for rel_path in likely_relative_paths:
+            cand_path = safe_evidence_path(case_id, rel_path)
+            if cand_path and os.path.isdir(cand_path):
+                prefetch_dir = cand_path
+                found_prefetch = True
+                break
+
+    if not found_prefetch:
+        # Bounded os.walk search: max depth 4, do not follow symlinks, prune directories
+        for root, dirs, files in os.walk(evidence_dir, followlinks=False):
+            # Calculate current depth relative to evidence_dir
+            if root == evidence_dir:
+                depth = 0
+            else:
+                rel = os.path.relpath(root, evidence_dir)
+                depth = len(rel.split(os.sep))
+            
+            # Prune directories we don't want to visit
+            prune_names = {
+                "documents and settings",
+                "system volume information",
+                "$recycle.bin",
+                "recovery",
+                "winsxs",
+                "program files",
+                "program files (x86)",
+                "users",
+                "programdata"
+            }
+            # Modify dirs in-place to prune them from traversal
+            dirs[:] = [d for d in dirs if d.lower() not in prune_names]
+            
+            # Limit depth recursion
+            if depth >= 4:
+                dirs.clear()
+            
+            # Stop as soon as a directory named Prefetch is found
+            for d in dirs:
+                if d.lower() == "prefetch":
+                    prefetch_dir = os.path.join(root, d)
+                    found_prefetch = True
+                    break
+            if found_prefetch:
+                break
+
+    if not found_prefetch:
+        # Check if Windows directory exists (case-insensitively)
+        windows_exists = False
+        for win_name in ["Windows", "WINDOWS", "windows"]:
+            win_dir = safe_evidence_path(case_id, win_name)
+            if win_dir and os.path.isdir(win_dir):
+                windows_exists = True
+                break
+
+        if windows_exists:
+            return json.dumps({
+                "status": "no_results",
+                "artifact_source": "prefetch",
+                "case_id": case_id,
+                "error": "Prefetch directory not found.",
+                "possible_reason": "Windows XP, Prefetch disabled, Prefetch cleared, or unsupported mounted layout",
+                "pivot_suggestion": "analyze_mft with filename_filter='Prefetch'"
+            })
         else:
-            # Also check if Windows directory exists but Prefetch is missing
-            windows_dir = safe_evidence_path(case_id, "Windows")
-            if windows_dir and os.path.isdir(windows_dir):
-                return json.dumps({
-                    "error": "Prefetch directory not found. Windows "
-                             "directory exists but Prefetch is absent. "
-                             "This may be Windows XP (Prefetch disabled) "
-                             "or Prefetch was deliberately cleared. "
-                             "Pivot to analyze_mft with "
-                             "filename_filter='Prefetch' to investigate.",
-                    "artifact_source": "prefetch",
-                    "case_id": case_id,
-                    "pivot_suggestion": "analyze_mft"
-                })
             return json.dumps({
                 "error": f"Prefetch directory not found at {ARTIFACT_PATHS['prefetch']}",
                 "artifact_source": "prefetch",
