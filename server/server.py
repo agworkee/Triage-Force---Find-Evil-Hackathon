@@ -1010,19 +1010,39 @@ def analyze_evtx(case_id: str, log_name: str = "Security", event_ids: str = "", 
     Returns:
         Structured JSON with artifact_source, timestamps, and parsed entries.
     """
+    log_name_lower = log_name.lower()
+    if log_name_lower == "__list__":
+        logs_dir = safe_evidence_path(case_id, "Windows/System32/winevt/Logs")
+        if logs_dir is None or not os.path.exists(logs_dir):
+            return json.dumps({"error": "Logs directory not found", "case_id": case_id})
+        try:
+            evtx_files = []
+            for entry in os.scandir(logs_dir):
+                if entry.is_file() and entry.name.lower().endswith(".evtx"):
+                    evtx_files.append({
+                        "name": entry.name,
+                        "size": entry.stat().st_size
+                    })
+            return json.dumps({"case_id": case_id, "logs": evtx_files})
+        except Exception as e:
+            return json.dumps({"error": f"Failed to list logs: {str(e)}", "case_id": case_id})
+
     # Map log_name to file path
     log_map = {
         "security": ARTIFACT_PATHS["evtx_security"],
         "system": ARTIFACT_PATHS["evtx_system"],
         "application": ARTIFACT_PATHS["evtx_application"],
+        "directory service": "Windows/System32/winevt/Logs/Directory Service.evtx",
+        "dns server": "Windows/System32/winevt/Logs/DNS Server.evtx",
+        "dfs replication": "Windows/System32/winevt/Logs/DFS Replication.evtx",
     }
-    relative = log_map.get(log_name.lower())
+    relative = log_map.get(log_name_lower)
     if relative is None:
-        return json.dumps({
-            "error": f"Unknown log_name '{log_name}'. Supported: Security, System, Application",
-            "artifact_source": "evtx",
-            "case_id": case_id,
-        })
+        # Sanitize to prevent path traversal, check/add .evtx extension
+        base_name = os.path.basename(log_name)
+        if not base_name.lower().endswith(".evtx"):
+            base_name += ".evtx"
+        relative = os.path.join("Windows/System32/winevt/Logs", base_name)
 
     evtx_path = safe_evidence_path(case_id, relative)
     if evtx_path is None:
@@ -1035,10 +1055,11 @@ def analyze_evtx(case_id: str, log_name: str = "Security", event_ids: str = "", 
             "case_id": case_id,
         })
 
-    csv_path = f"/tmp/evtx_{log_name.lower()}_output.csv"
+    log_name_clean = log_name_lower.replace(" ", "_").replace(".", "_").replace("/", "_").replace("\\", "_")
+    csv_path = f"/tmp/evtx_{log_name_clean}_output.csv"
     cmd = [
         "EvtxECmd", "-f", evtx_path,
-        "--csv", "/tmp", "--csvf", f"evtx_{log_name.lower()}_output.csv"
+        "--csv", "/tmp", "--csvf", f"evtx_{log_name_clean}_output.csv"
     ]
     res = run_local_command(cmd, timeout=180)
 
@@ -2674,6 +2695,135 @@ def analyze_autoruns(case_id: str) -> str:
         "entries": entries,
         "parser": "RECmd+xml.etree+filesystem",
         "status": "success" if entries else "no_results",
+    })
+
+
+@mcp.tool()
+def analyze_domain_controller_artifacts(case_id: str) -> str:
+    """
+    Analyze domain controller specific artifacts in the case evidence.
+
+    Returns a quick inventory of DC roles and configurations including NTDS.dit,
+    SYSVOL, domain registry hives, and specialized EVTX logs.
+    Does not dump credentials or parse NTDS database contents.
+
+    Args:
+        case_id: The case identifier.
+
+    Returns:
+        Structured JSON summarizing DC artifact availability and metadata.
+    """
+    evidence_dir = safe_evidence_path(case_id, "")
+    if evidence_dir is None:
+        return json.dumps({"error": "Path traversal detected"})
+
+    results = {}
+    
+    # 1. NTDS.dit Check
+    ntds_path_rel = "Windows/NTDS/ntds.dit"
+    ntds_path = safe_evidence_path(case_id, ntds_path_rel)
+    ntds_exists = False
+    ntds_metadata = {}
+    if ntds_path and os.path.exists(ntds_path):
+        ntds_exists = True
+        try:
+            stat = os.stat(ntds_path)
+            from datetime import datetime, timezone
+            ntds_metadata = {
+                "path": ntds_path_rel,
+                "size": stat.st_size,
+                "modified": str(datetime.fromtimestamp(stat.st_mtime, timezone.utc))
+            }
+        except Exception as e:
+            ntds_metadata = {"error": str(e)}
+    results["ntds"] = {"exists": ntds_exists, "metadata": ntds_metadata}
+
+    # 2. SYSVOL Check
+    sysvol_path_rel = "Windows/SYSVOL"
+    sysvol_path = safe_evidence_path(case_id, sysvol_path_rel)
+    sysvol_exists = False
+    sysvol_files_count = 0
+    if sysvol_path and os.path.isdir(sysvol_path):
+        sysvol_exists = True
+        try:
+            # Cheap file count
+            for root, dirs, files in os.walk(sysvol_path):
+                sysvol_files_count += len(files)
+        except Exception:
+            pass
+    results["sysvol"] = {"exists": sysvol_exists, "file_count": sysvol_files_count}
+
+    # 3. Registry Hives Check
+    hives = {
+        "SYSTEM": "Windows/System32/config/SYSTEM",
+        "SAM": "Windows/System32/config/SAM",
+        "SECURITY": "Windows/System32/config/SECURITY",
+        "SOFTWARE": "Windows/System32/config/SOFTWARE"
+    }
+    hives_found = {}
+    for name, rel in hives.items():
+        path = safe_evidence_path(case_id, rel)
+        exists = False
+        size = 0
+        if path and os.path.exists(path):
+            exists = True
+            try:
+                size = os.path.getsize(path)
+            except Exception:
+                pass
+        hives_found[name] = {"exists": exists, "size": size}
+    results["registry_hives"] = hives_found
+
+    # 4. EVTX Logs Check
+    logs = {
+        "Security": "Windows/System32/winevt/Logs/Security.evtx",
+        "System": "Windows/System32/winevt/Logs/System.evtx",
+        "Directory Service": "Windows/System32/winevt/Logs/Directory Service.evtx",
+        "DNS Server": "Windows/System32/winevt/Logs/DNS Server.evtx",
+        "DFS Replication": "Windows/System32/winevt/Logs/DFS Replication.evtx",
+        "Sysmon": "Windows/System32/winevt/Logs/Microsoft-Windows-Sysmon%4Operational.evtx",
+        "PowerShell": "Windows/System32/winevt/Logs/Microsoft-Windows-PowerShell%4Operational.evtx"
+    }
+    logs_found = {}
+    for name, rel in logs.items():
+        path = safe_evidence_path(case_id, rel)
+        exists = False
+        size = 0
+        if path and os.path.exists(path):
+            exists = True
+            try:
+                size = os.path.getsize(path)
+            except Exception:
+                pass
+        logs_found[name] = {"exists": exists, "size": size}
+    results["evtx_logs"] = logs_found
+
+    # 5. Summarize DC indicators
+    dc_indicator_count = 0
+    if ntds_exists:
+        dc_indicator_count += 2
+    if sysvol_exists:
+        dc_indicator_count += 2
+    for name, log_info in logs_found.items():
+        if name in ["Directory Service", "DNS Server", "DFS Replication"] and log_info["exists"]:
+            dc_indicator_count += 1
+
+    dc_confirmed = dc_indicator_count >= 3
+
+    results["summary"] = {
+        "dc_confirmed": dc_confirmed,
+        "dc_indicator_count": dc_indicator_count,
+        "ntds_present": ntds_exists,
+        "sysvol_present": sysvol_exists,
+        "dc_evtx_logs_found": [k for k, v in logs_found.items() if v["exists"] and k in ["Directory Service", "DNS Server", "DFS Replication"]],
+        "registry_hives_found": [k for k, v in hives_found.items() if v["exists"]]
+    }
+
+    return json.dumps({
+        "artifact_source": "domain_controller_inventory",
+        "case_id": case_id,
+        "results": results,
+        "status": "success"
     })
 
 

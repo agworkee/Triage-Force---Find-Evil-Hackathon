@@ -6,12 +6,14 @@ TriageForce is an autonomous incident response and triage agent built for the SA
 
 ## 🏗️ Technical Architecture
 
+![TriageForce architecture](docs/triageforce_architecture.png)
+
 TriageForce enforces security at the architectural level rather than relying solely on prompt-based restrictions.
 
 ```
 ┌─────────────────────────────────────────────────────┐
 │                 Local Host (Client)                 │
-│              agent.py (Gemini 2.0 Client)           │
+│         agent.py (Gemini 2.5 Flash Client)          │
 └──────────────────────┬──────────────────────────────┘
                        │ SSH stdio tunnel (Passwordless)
                        │ Command: sudo /opt/triageforce/server.py
@@ -38,7 +40,7 @@ TriageForce enforces security at the architectural level rather than relying sol
 ```
 
 ### Key Security & Integrity Boundaries:
-*   **No Generic Shell Access:** Unlike bridged SSH MCP servers that expose shell access, `server.py` exposes *only* typed, read-only tools (22 total):
+*   **No Generic Shell Access:** Unlike bridged SSH MCP servers that expose shell access, `server.py` exposes *only* typed, read-only tools (23 total):
     *   `list_case_evidence`: Lists evidence files available in a case directory.
     *   `get_evidence_integrity`: Computes case file hashes (`sha256sum`).
     *   `run_tshark_summary`: Extracts network hierarchy information (`tshark`).
@@ -61,8 +63,9 @@ TriageForce enforces security at the architectural level rather than relying sol
     *   `analyze_network_connections`: Analyzes PCAP network captures (`tshark`).
     *   `analyze_browser_history`: Parses Chrome/Firefox/IE browser history databases (`sqlite3`).
     *   `analyze_autoruns`: Aggregates all persistence/autorun locations across registry, tasks, services, and startup folders.
+    *   `analyze_domain_controller_artifacts`: Inventories DC-specific artifacts (NTDS.dit, Directory Service logs, DNS Server logs, DFS Replication logs, Group Policy) for domain controller images.
     The agent has no mechanism to write files or run arbitrary commands.
-*   **Read-Only OS Mounts:** Original E01 disk images are mounted using `ewfmount` to stage a raw volume, which is then bind-mounted read-only at `/cases/case_001/evidence/` via `mount -o remount,ro,bind`.
+*   **Read-Only OS Mounts:** Original E01 disk images are mounted using `ewfmount` to stage a raw volume, which is then bind-mounted read-only at `/cases/<case_id>/evidence/` via `mount -o remount,ro,bind`.
 *   **Logical Consistency Checks:** Every iteration runs check rules inside `agent.py` to identify contradictions (e.g. conflicting hash results, timestamp timezone anomalies, or attempted write actions) and flags them immediately.
 
 ---
@@ -101,7 +104,7 @@ Instead of unstructured text, findings are gathered into structured `EvidenceObj
 
 ### 2. Multi-Source Confidence Scoring
 Confidence scores (`0.0` - `1.0`) are dynamically computed based on SIFT sources and modifiers:
-- **Base Score**: 1 source = `0.25` (Low), 2 independent sources = `0.50` (Medium), 3+ corroborating sources = `0.75` (High).
+- **Base Score**: 1 source = `0.25` (Low), 2 independent sources = `0.50` (Medium), 3+ corroborating sources = `0.75` (High). For host-role/context findings, composite `analyze_domain_controller_artifacts` inventory output is expanded into independent artifact family sources (e.g. ntds, sysvol, registry_hives, specialized evtx logs) if present.
 - **Contradiction Modifier**: `-0.15` per contradictory observation.
 - **Verification Modifiers**: Successful verification adds `+0.10`; failed verification subtracts `-0.10`.
 - **DFIR Rule Warning**: Deducts `-0.05` per violation.
@@ -154,7 +157,7 @@ Every phase of the cognitive loop writes detailed, structured logs to `agent_exe
 Ensure python virtualenv and custom server script are correctly placed on the SIFT VM:
 1. **Server Directory:** `/opt/triageforce/`
 2. **Server Python Venv:** `/opt/triageforce/venv/`
-3. **Mounted Case Data:** `/cases/case_001/evidence/` (Contains read-only mounted raw file `ewf1`).
+3. **Mounted Case Data:** `/cases/<case_id>/evidence/` (Contains read-only mounted filesystem). Each case is isolated under its own directory (e.g. `case_001`, `case_002`).
 4. **Passwordless sudo:** The `sansforensics` user must be configured for passwordless sudo (standard on SIFT workstation VMs) to access the raw evidence files owned by `root`.
 
 ### Local Client Setup (Windows Host)
@@ -186,7 +189,14 @@ python agent.py --test-connection
 ### 2. Start Triage Task
 Launch the autonomous forensic agent to investigate case files:
 ```bash
+# Investigate the default case (case_001)
 python agent.py --task "Generate a list of case evidence files and compile a protocol hierarchy summary of the network pcap"
+
+# Investigate a different case
+python agent.py --case-id case_002 --task "Perform full forensic triage on case_002"
+
+# Adjust API rate-limiting sleep interval
+python agent.py --case-id case_001 --sleep-interval 15 --task "Analyze security event log for logon events"
 ```
 
 ### 3. Review Audit Logs

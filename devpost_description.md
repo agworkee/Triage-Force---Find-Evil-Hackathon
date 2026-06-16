@@ -4,7 +4,7 @@ An autonomous incident response and forensic triage agent built to investigate c
 
 ## What it does
 
-TriageForce acts as an autonomous virtual forensic analyst that conducts end-to-end investigations on mounted forensic disk images. It connects to a remote SANS SIFT workstation, gathers and correlates historical and execution artifacts using **22 typed, read-only MCP tools**, builds an interactive timeline of events, validates findings against DFIR best practices, maps compromised artifacts to MITRE ATT&CK techniques, and outputs a complete, audit-logged forensic report.
+TriageForce acts as an autonomous virtual forensic analyst that conducts end-to-end investigations on mounted forensic disk images. It connects to a remote SANS SIFT workstation, gathers and correlates historical and execution artifacts using **23 typed, read-only MCP tools**, builds an interactive timeline of events, validates findings against DFIR best practices, maps compromised artifacts to MITRE ATT&CK techniques, and outputs a complete, audit-logged forensic report.
 
 Through a structured, self-correcting analyst loop, the agent avoids early conclusions and hallucinatory claims by challenging its own findings. When a tool fails or returns empty results, built-in **Forensic Pivot Rules** automatically redirect the agent to alternative tools within the same artifact class. Specifically, it can:
 - **List and Hash Evidence**: Inspect case evidence directory file lists and calculate cryptographically secure hashes (SHA-256) of raw images.
@@ -17,6 +17,8 @@ Through a structured, self-correcting analyst loop, the agent avoids early concl
 
 ## How we built it
 
+![TriageForce architecture](docs/triageforce_architecture.png)
+
 TriageForce consists of two primary components communicating over a secure stdio JSON-RPC protocol tunnel:
 1. **Local Forensic Client (`agent.py`)**: A Python client implementing a cognitive analyst loop leveraging the Google Gemini SDK. It manages the agentic workflow across distinct cognitive stages:
    - **`InvestigationPlanner`**: Formulates structured, hypothesis-driven plans before invoking remote SIFT tools.
@@ -24,7 +26,7 @@ TriageForce consists of two primary components communicating over a secure stdio
    - **`DFIRValidator`**: Enforces strict industry best practices. It enforces a **0.40 hard threshold**, meaning any finding with a confidence score under `0.40` is blocked from transition to `verified` status and remains `inconclusive`.
    - **`ForensicTimeline`**: Normalizes all extracted timestamps to UTC, sorts events chronologically, and checks for logical timeline anomalies (e.g., file execution before file creation).
    - **`MitreAttackMapper`**: Maps parsed forensic findings directly to the tactics and techniques of the MITRE ATT&CK framework.
-2. **Custom MCP Server (`server.py`)**: A Python-based Model Context Protocol server running on the remote SANS SIFT VM under root context. It exposes **22 typed, read-only tools** to the client. Rather than granting the agent a generic shell prompt (which introduces execution risk and commands that could modify evidence), it maps inputs to specific, read-only wrapper functions utilizing native SIFT forensic parsers like `PECmd`, `AmcacheParser`, `AppCompatCacheParser`, `RECmd`, `EvtxECmd`, `MFTECmd`, `LECmd`, `RBCmd`, `tshark`, and Python's `sqlite3` and `xml.etree` modules.
+2. **Custom MCP Server (`server.py`)**: A Python-based Model Context Protocol server running on the remote SANS SIFT VM under root context. It exposes **23 typed, read-only tools** to the client. Rather than granting the agent a generic shell prompt (which introduces execution risk and commands that could modify evidence), it maps inputs to specific, read-only wrapper functions utilizing native SIFT forensic parsers like `PECmd`, `AmcacheParser`, `AppCompatCacheParser`, `RECmd`, `EvtxECmd`, `MFTECmd`, `LECmd`, `RBCmd`, `tshark`, and Python's `sqlite3` and `xml.etree` modules.
 
 ### Target Case Validation
 To demonstrate the capabilities of TriageForce, we triaged a real-world compromised Windows XP disk image (`dmz-ftp-cdrive.E01`). The agent successfully reconstructed the attack chain with high confidence, identifying:

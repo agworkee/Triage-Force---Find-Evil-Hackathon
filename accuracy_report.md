@@ -49,7 +49,7 @@ The following potential sources of evidence were not analyzed due to target OS l
 
 ## Expanded Tool Coverage
 
-TriageForce now exposes **22 typed, read-only tools** on the MCP server (up from 12), covering:
+TriageForce now exposes **23 typed, read-only tools** on the MCP server (up from 12), covering:
 
 | Category | Tools | Parser |
 |---|---|---|
@@ -59,6 +59,7 @@ TriageForce now exposes **22 typed, read-only tools** on the MCP server (up from
 | **Event Logs** | `analyze_sysmon`, `analyze_evtx`, `analyze_powershell_logs` | EvtxECmd |
 | **Network** | `run_tshark_summary`, `analyze_network_connections` | tshark |
 | **User Activity** | `analyze_browser_history`, `analyze_recyclebin`, `analyze_scheduled_tasks` | sqlite3, RBCmd, XML |
+| **Domain Controller** | `analyze_domain_controller_artifacts` | os.walk inventory |
 | **Evidence Management** | `list_case_evidence`, `get_evidence_integrity` | sha256sum |
 
 ### Forensic Pivot Testing
@@ -74,7 +75,7 @@ The agent's `FORENSIC PIVOT RULES` were validated during the target case analysi
 
 To protect against standard LLM hallucinations (such as inventing logs or registry keys), TriageForce enforces strict mitigation rules:
 
-- **Single-Source Capping**: Any finding backed by only one evidence source (e.g. only a ShimCache entry with no Sysmon or Event Log corroboration) is automatically capped at a maximum confidence score of **`0.30` (LOW)**.
+- **Single-Source Capping**: Any finding backed by only one evidence source (e.g. only a ShimCache entry with no Sysmon or Event Log corroboration) is automatically capped at a maximum confidence score of **`0.30` (LOW)**. *Note: Composite DC context findings with 3+ present artifact families from `analyze_domain_controller_artifacts` expand into independent family sources and are exempted from single-source capping.*
 - **Hard Verification Threshold**: A hard threshold of **`0.40`** is enforced. If a finding fails to gather enough corroborating evidence to push its score to `0.40` or above, it is blocked from transitioning to `verified` status and is classified as `inconclusive`.
 
 ---
@@ -84,7 +85,7 @@ To protect against standard LLM hallucinations (such as inventing logs or regist
 TriageForce guarantees evidence preservation through multi-layered architectural boundaries:
 
 1. **Read-Only Mounts**: The raw disk image is mounted strictly read-only using `ntfs-3g` and then bind-mounted (`mount -o remount,ro,bind`). 
-2. **Type-Safe MCP Server**: The `server.py` file exposes 22 typed, read-only tool wrappers. The model can only execute pre-defined python wrappers — no shell access is granted.
+2. **Type-Safe MCP Server**: The `server.py` file exposes 23 typed, read-only tool wrappers. The model can only execute pre-defined python wrappers — no shell access is granted.
 3. **Path Traversal Protection**: Every file tool validates input parameters via `safe_evidence_path()`, blocking traversal attempts (e.g. `../../etc/passwd`) by checking that the resolved path strictly starts with the `/cases` root.
 
 ---

@@ -34,7 +34,9 @@ scp server/server.py sansforensics@192.168.255.128:/opt/triageforce/server.py
 
 ## Evidence Mount Instructions
 
-Copy the target `dmz-ftp-cdrive.E01` disk image to your SIFT VM and execute the mount sequence to expose the evidence directory read-only:
+Copy the target E01 disk image to your SIFT VM and execute the mount sequence to expose the evidence directory read-only. Below are examples for both validated cases.
+
+### case_001 — DMZ FTP Server (Windows XP)
 ```bash
 # 1. Stage the raw disk file from the E01 image
 sudo ewfmount /cases/case_001/image/dmz-ftp-cdrive.E01 /cases/case_001/evidence
@@ -46,6 +48,15 @@ sudo ntfs-3g -o ro,loop,show_sys_files,streams_interface=windows /cases/case_001
 # 3. Perform a read-only bind mount to establish the secure TriageForce evidence vault
 sudo mount --bind /cases/case_001/mount /cases/case_001/evidence/
 sudo mount -o remount,ro,bind /cases/case_001/evidence/
+```
+
+### case_002 — Domain Controller (Windows Server)
+```bash
+# 1. Stage the raw disk file
+sudo ewfmount /cases/case_002/raw/base-dc-cdrive.E01 /cases/case_002/ewf
+
+# 2. Mount the underlying NTFS partition read-only
+sudo mount -o ro,loop,show_sys_files /cases/case_002/ewf/ewf1 /cases/case_002/evidence
 ```
 
 ---
@@ -75,7 +86,11 @@ python agent.py --test-connection
 ### 2. Run the Triage Loop
 Execute the main autonomous triage loop to begin the investigation:
 ```bash
-python agent.py --task "Perform full forensic triage on case_001: list all evidence files, verify integrity of available files, analyze prefetch artifacts for program execution history, analyze amcache for installed/executed programs, check shimcache for additional execution evidence, examine security event log for logon events 4624 and 4688, and produce a full correlation report mapping findings to MITRE ATT&CK techniques"
+# Investigate case_001 (default)
+python agent.py --task "Perform full forensic triage on case_001: list all evidence files, verify integrity, analyze shimcache, examine security event log for logon events 4624 and 4688, and produce a full correlation report mapping findings to MITRE ATT&CK techniques"
+
+# Investigate case_002 (domain controller)
+python agent.py --case-id case_002 --task "Perform full forensic triage on case_002: inventory DC artifacts, analyze directory service logs, check shimcache for execution evidence, and produce a correlation report"
 ```
 
 ---
@@ -84,7 +99,7 @@ python agent.py --task "Perform full forensic triage on case_001: list all evide
 
 When you run the agent, the console will display the following structured stages:
 
-1. **Pre-flight Diagnostic**: Connection status, remote host credentials, and list of 22 discovered MCP tools.
+1. **Pre-flight Diagnostic**: Connection status, remote host credentials, and list of 23 discovered MCP tools.
 2. **Investigation Plans**: Blocks starting with `[Planner] New investigation plan generated` specifying hypotheses and tools.
 3. **Evidence Claims**: Structural blocks starting with `evidence_claim` showing initial findings and base confidence scores.
 4. **Verification Stage**: Bounded iteration blocks starting with `[Verify H-00X]` where the agent challenges its own claims.
