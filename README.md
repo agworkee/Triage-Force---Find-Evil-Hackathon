@@ -1,3 +1,11 @@
+## Correct Demo Video
+
+The Devpost embedded video was uploaded incorrectly during the deadline rush.
+
+**Correct TriageForce demo video:** https://youtu.be/zGbFd1gBQZg
+
+Submitted code snapshot: tag `submitted-june-15`
+
 # TriageForce — Autonomous Forensic Triage Agent (Find Evil! Hackathon)
 
 TriageForce is an autonomous incident response and triage agent built for the SANS SIFT Workstation. It leverages the **Google Gemini SDK** and the **Model Context Protocol (MCP)** to securely automate forensic evidence gathering, artifact extraction, and correlation while strictly maintaining evidence integrity.
